@@ -19,14 +19,15 @@
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too, and [`FORMAT`] bumped.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 /// The encoding of entries ([`encode`]), part of the key.
 const FORMAT: u32 = 2;
 
-use victory_pipeline::{Cache, Converter};
+use victory_pipeline::{Cache, CacheKey, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
@@ -171,36 +172,129 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+/// there is one, using a caller-supplied translator so already-parsed
+/// containers and native programs do not get disassembled twice on a miss.
+pub(crate) fn host_shader_with(
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
-struct Translate<'a, F> {
-    translate: F,
-    /// The build of the translator, written into the entry.
-    source: &'a str,
-    ran: AtomicBool,
-}
+/// Metadata-only [`Converter`] used to compute the exact same [`CacheKey`]
+/// without allocating a concatenated `[build, container]` vector or re-reading
+/// a freshly translated [`HostShader`] back from disk.
+struct KeyMeta;
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<'_, F> {
+impl Converter for KeyMeta {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
         1
     }
-    fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader, self.source))
+    fn convert(&self, _input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        unreachable!("shader_cache writes encoded entries directly")
+    }
+}
+
+struct WriteQueue {
+    pending: HashMap<CacheKey, Vec<u8>>,
+    order: VecDeque<(Cache, CacheKey)>,
+    writing: bool,
+}
+
+static WRITE_QUEUE: Mutex<Option<WriteQueue>> = Mutex::new(None);
+static WRITE_WAKE: Condvar = Condvar::new();
+static WRITE_IDLE: Condvar = Condvar::new();
+
+fn ensure_writer() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("victory-shader-cache".into())
+            .spawn(|| {
+                // SAFETY: plain call on our own background thread.
+                unsafe {
+                    use windows::Win32::System::Threading::{
+                        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                    };
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
+                loop {
+                    let next = {
+                        let mut guard = WRITE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            let q = guard.get_or_insert_with(|| WriteQueue {
+                                pending: HashMap::new(),
+                                order: VecDeque::new(),
+                                writing: false,
+                            });
+                            if let Some((cache, key)) = q.order.pop_front() {
+                                if let Some(bytes) = q.pending.get(&key).cloned() {
+                                    q.writing = true;
+                                    break (cache, key, bytes);
+                                }
+                                continue;
+                            }
+                            q.writing = false;
+                            WRITE_IDLE.notify_all();
+                            guard = WRITE_WAKE.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let (cache, key, bytes) = next;
+                    if let Err(e) = cache.write_entry(&key, &bytes) {
+                        tracing::debug!(error = %e, "shader cache async write failed");
+                    }
+                    let mut guard = WRITE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(q) = guard.as_mut() {
+                        q.pending.remove(&key);
+                        if q.order.is_empty() {
+                            q.writing = false;
+                            WRITE_IDLE.notify_all();
+                        }
+                    }
+                }
+            })
+            .is_ok()
+    })
+}
+
+fn pending_bytes(key: &CacheKey) -> Option<Vec<u8>> {
+    let guard = WRITE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.pending.get(key).cloned()
+}
+
+fn enqueue_write(cache: &Cache, key: CacheKey, encoded: Vec<u8>) -> bool {
+    const MAX_IN_FLIGHT: usize = 1024;
+    if !ensure_writer() {
+        return false;
+    }
+    let mut guard = WRITE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let q = guard.get_or_insert_with(|| WriteQueue {
+        pending: HashMap::new(),
+        order: VecDeque::new(),
+        writing: false,
+    });
+    if q.pending.len() >= MAX_IN_FLIGHT {
+        return false;
+    }
+    if !q.pending.contains_key(&key) {
+        q.pending.insert(key, encoded);
+        q.order.push_back((cache.clone(), key));
+        WRITE_WAKE.notify_one();
+    }
+    true
+}
+
+/// Waits for any queued background shader-cache writes to finish on disk.
+pub fn flush() {
+    let mut guard = WRITE_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    while guard.as_ref().is_some_and(|q| !q.order.is_empty() || q.writing) {
+        guard = WRITE_IDLE.wait(guard).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -225,54 +319,54 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
-    let converter = Translate {
-        translate,
-        source,
-        ran: AtomicBool::new(false),
-    };
+    let key = CacheKey::from_slices(&KeyMeta, &[&build[..], container]);
+    let path = cache.path_for(&key);
     let mut old: Option<HostShader> = None;
-    for _ in 0..3 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let ran = converter.ran.load(Ordering::Relaxed);
-            if !ran && made_by != source.as_bytes() {
-                STALE.fetch_add(1, Ordering::Relaxed);
-                if refresh && old.is_none() {
-                    // Translated again in its place; what came out before
-                    // is what the new one is compared with.
-                    tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
-                    old = Some(shader);
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                static SAID: AtomicBool = AtomicBool::new(false);
-                if !SAID.swap(true, Ordering::Relaxed) {
-                    tracing::info!("shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again");
-                }
-            }
-            if let Some(old) = old.take() {
-                REFRESHED.fetch_add(1, Ordering::Relaxed);
-                if old != shader {
-                    CHANGED.fetch_add(1, Ordering::Relaxed);
+    if let Some(raw) = pending_bytes(&key).or_else(|| std::fs::read(&path).ok()) {
+        match decode(&raw) {
+            Some((shader, made_by)) => {
+                if made_by != source.as_bytes() {
+                    STALE.fetch_add(1, Ordering::Relaxed);
+                    if refresh {
+                        tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
+                        old = Some(shader);
+                    } else {
+                        static SAID: AtomicBool = AtomicBool::new(false);
+                        if !SAID.swap(true, Ordering::Relaxed) {
+                            tracing::info!("shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again");
+                        }
+                        HITS.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(path = %path.display(), "shader from the cache");
+                        return Ok(shader);
+                    }
+                } else {
+                    HITS.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(path = %path.display(), "shader from the cache");
+                    return Ok(shader);
                 }
             }
-            let (counter, what) = if ran {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            None => {
+                tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
+                let _ = std::fs::remove_file(&path);
+            }
         }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
-        let _ = std::fs::remove_file(&path);
+    }
+    let shader = translate(container)?;
+    let encoded = encode(&shader, source);
+    if refresh || cfg!(test) || !enqueue_write(cache, key, encoded.clone()) {
+        if let Err(e) = cache.write_entry(&key, &encoded) {
+            tracing::debug!(error = %e, path = %path.display(), "shader cache write failed");
+        }
+    }
+    if let Some(old) = old.take() {
+        REFRESHED.fetch_add(1, Ordering::Relaxed);
+        if old != shader {
+            CHANGED.fetch_add(1, Ordering::Relaxed);
+        }
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    tracing::debug!(path = %path.display(), "shader translated and cached");
+    Ok(shader)
 }
 
 const MAGIC: &[u8; 4] = b"VSH2";

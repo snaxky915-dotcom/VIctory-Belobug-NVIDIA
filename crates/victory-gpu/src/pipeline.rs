@@ -214,7 +214,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let main_prog = programs
+        .iter()
+        .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs));
+    let host = crate::shader_cache::host_shader_with(container, |raw| match main_prog {
+        Some(native) => victory_shader::emit::translate_parsed(&c, native).map_err(|e| e.to_string()),
+        None => victory_shader::emit::translate(raw).map_err(|e| e.to_string()),
+    })?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -796,6 +802,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
+    crate::shader_cache::flush();
     library::save(true);
     known::flush();
 }

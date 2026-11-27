@@ -173,6 +173,19 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
+    // On <= 6 GiB VRAM budgets (e.g. RTX 4050 6 GB laptop with 5.0 GiB WDDM
+    // budget), keep total local usage around 74-80% (~3.7-4.0 GiB) so render
+    // targets (1.4 GiB) + 640 MB card buffers + active textures never spill
+    // over the 5.0 GiB budget into slow PCIe shared memory.
+    if budget <= (6 << 30) {
+        if used < share(76) {
+            return (30_000, u64::MAX);
+        } else if used < share(85) {
+            return (2_500, used - share(72));
+        } else {
+            return (1_200, used - share(74));
+        }
+    }
     if used < share(85) {
         (KEPT_MS, u64::MAX)
     } else if used < share(93) {
@@ -5373,6 +5386,14 @@ impl Host {
         let _ = self.submit(runs, &[], false);
     }
 
+    /// Runs a closed internal upload-only host list synchronously without
+    /// draining title queues (`queue::before_sync`), so it is deadlock-safe
+    /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
+    /// GPU work and waits for the upload list's fence before returning.
+    pub(crate) fn execute_sync_internal(&self, list: &HostList) {
+        let _ = self.submit(&[list], &[], false);
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in
@@ -6591,6 +6612,11 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        !self.deferred().copies.is_empty()
+            || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     pub(crate) fn reset(&self) {
         self.changed_something();
         #[cfg(feature = "diagnostics")]

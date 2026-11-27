@@ -274,20 +274,47 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
-    let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+    let total = blocks * stride;
+    thread_local! {
+        static RECORDS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    RECORDS.with_borrow_mut(|buf| {
+        if buf.len() < total {
+            buf.resize(total, 0);
+        }
+        let res = {
+            let records = &mut buf[..total];
+            let mut src_pos = 0usize;
+            lanes(
+                tables,
+                widths,
+                per,
+                blocks,
+                |_| {
+                    let b = *src.get(src_pos)?;
+                    src_pos += 1;
+                    Some(b)
+                },
+                records,
+            )?;
+            let records = records.chunks_exact(stride);
+            let out = dst.chunks_exact_mut(block);
+            let t = tables;
+            match bc {
+                1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+                3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+                4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+                5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+                6 => bc6(records, out, &t.bc6),
+                _ => bc7(records, out, t),
+            }
+        };
+        if buf.capacity() > (16 << 20) {
+            buf.truncate(4 << 20);
+            buf.shrink_to(4 << 20);
+        }
+        res
+    })
 }
 
 // Lanes.
@@ -312,6 +339,7 @@ struct Lane {
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
     /// decode at most one symbol.
+    #[inline(always)]
     fn step(&mut self, t: &Tables) -> Result<(), Error> {
         if self.phase != 3 {
             let Some(b) = self.latch.take() else {
@@ -389,7 +417,7 @@ impl Lane {
 /// The bucket holding `slot` (below 65536): the last whose start is at or
 /// below it. The window table gives the bucket of the window's first slot;
 /// later buckets that start inside the window are stepped over.
-#[inline]
+#[inline(always)]
 fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
     let start = &t.start[usize::from(model)];
     let mut b = usize::from(t.bucket[usize::from(model)][(slot >> 8) as usize]);
@@ -471,7 +499,12 @@ fn lanes(
 
 // Blocks.
 
+const SPREAD4: [u8; 16] = [
+    0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15, 0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55,
+];
+
 /// The record's endpoint and index references.
+#[inline(always)]
 fn references(s: &[u8], paired: bool) -> (usize, usize) {
     let (d, ix) = if paired {
         (interleave(s[0], s[1]), interleave(s[2], s[3]))
@@ -483,13 +516,14 @@ fn references(s: &[u8], paired: bool) -> (usize, usize) {
 }
 
 /// Two 4-bit symbols, the first on the even bits.
+#[inline(always)]
 fn interleave(a: u8, b: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
-    spread(a) | spread(b) << 1
+    SPREAD4[usize::from(a & 15)] | (SPREAD4[usize::from(b & 15)] << 1)
 }
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
 /// block into the dictionary.
+#[inline(always)]
 fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: &'a T) -> &'a T {
     match r {
         0 => zero,
@@ -499,6 +533,7 @@ fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: 
 }
 
 /// Zigzag residual (0, -1, 1, -2, ...) modulo 2^bits.
+#[inline(always)]
 fn zz(v: u8, bits: u32) -> u8 {
     let mask = ((1u32 << bits) - 1) as u8;
     ((v >> 1) ^ if v & 1 != 0 { mask } else { 0 }) & mask
@@ -534,7 +569,7 @@ fn plain<'a>(
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
+    let mut history = [Plain { ep: [0; 8], ix: [0; 32] }; HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, w.paired);
@@ -660,16 +695,36 @@ fn bc5_pack(v: &Plain, out: &mut [u8]) {
     bc4_alpha(v.ep[2], v.ep[3], &v.ix[16..], &mut out[8..]);
 }
 
+const NIBBLE_LUT: [[i16; 2]; 256] = {
+    let mut lut = [[0i16; 2]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut even_u = 0u8;
+        let mut odd_u = 0u8;
+        let mut k = 0;
+        while k < 4 {
+            even_u |= ((b as u8 >> (2 * k)) & 1) << k;
+            odd_u |= ((b as u8 >> (2 * k + 1)) & 1) << k;
+            k += 1;
+        }
+        let even = (even_u >> 1) as i16 ^ -((even_u & 1) as i16);
+        let odd = (odd_u >> 1) as i16 ^ -((odd_u & 1) as i16);
+        lut[b] = [even, odd];
+        b += 1;
+    }
+    lut
+};
+
 /// A byte's even and odd bits as two zigzag-coded 4-bit residuals.
+#[inline(always)]
 fn nibbles(b: u8, odd_first: bool) -> [i16; 2] {
-    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
-    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
-    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    let [even, odd] = NIBBLE_LUT[usize::from(b)];
     if odd_first { [odd, even] } else { [even, odd] }
 }
 
 /// Index residual plus reference, both left-aligned to 16 bits at their own
 /// widths, back to `bits` bits (signed).
+#[inline(always)]
 fn add_index(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
     let up = |v: i16, b: u8| {
         if b == 0 || b > 16 {
@@ -690,6 +745,7 @@ struct Bits {
 }
 
 impl Bits {
+    #[inline(always)]
     fn put(&mut self, value: u64, n: u32) {
         if n > 0 && self.at < 128 {
             self.v |= (u128::from(value) & ((1u128 << n) - 1)) << self.at;
@@ -762,7 +818,7 @@ fn bc7<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    let mut history = [(Bc7Ep { ctrl: 0, rows: [[0; 8]; 3] }, Bc7Ix { bits: [0; 2], ix: [[0; 16]; 2] }); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -847,6 +903,7 @@ fn bc7<'a>(
     Ok(())
 }
 
+#[inline(always)]
 fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let ctrl = ep.ctrl;
     let mode = ctrl & 7;
@@ -886,15 +943,15 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
         m if pbits(m) => (0..ends).for_each(|e| w.put(field(e / 2, e % 2, prec[0]) & 1, 1)),
         _ => {}
     }
-    let anchors: &[u8] = match subsets {
-        2 => &[0, ANCHOR2[part]],
-        3 => &[0, ANCHOR3A[part], ANCHOR3B[part]],
-        _ => &[0],
+    let anchor_mask: u16 = match subsets {
+        2 => 1 | (1u16 << ANCHOR2[part]),
+        3 => 1 | (1u16 << ANCHOR3A[part]) | (1u16 << ANCHOR3B[part]),
+        _ => 1,
     };
     let mut indices = |set: usize| {
         let bits = ix.bits[set];
         for (p, &v) in ix.ix[set].iter().enumerate() {
-            let n = u32::from(bits) - u32::from(anchors.contains(&(p as u8)));
+            let n = u32::from(bits) - u32::from((anchor_mask >> p) & 1);
             w.put(u64::from(v as u16), n);
         }
     };
@@ -1062,7 +1119,7 @@ fn bc6<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    let mut history = [(Bc6Ep { e: [[0; 3]; 4] }, Bc6Ix { mode: 0, ix: [0; 16] }); HISTORY];
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
@@ -1071,11 +1128,10 @@ fn bc6<'a>(
         },
     );
     let z = |v: u16| (v >> 1) ^ (v & 1).wrapping_neg();
-    let wide = |a: u8, b: u8| {
-        (0..8).fold(0u16, |acc, k| {
-            acc | u16::from(a >> k & 1) << (2 * k) | u16::from(b >> k & 1) << (2 * k + 1)
-        })
+    let spread8 = |x: u8| {
+        u16::from(SPREAD4[usize::from(x & 15)]) | (u16::from(SPREAD4[usize::from(x >> 4)]) << 8)
     };
+    let wide = |a: u8, b: u8| spread8(a) | (spread8(b) << 1);
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
         let mode = s[30].wrapping_add(1);

@@ -150,7 +150,7 @@ static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
 /// What each slot's worker is making, and whether it takes passes over the
 /// screen alone. Never locked by the handler.
-static ACTIVE_JOBS: Mutex<Vec<Option<(Arc<Pending>, bool)>>> = Mutex::new(Vec::new());
+static ACTIVE_JOBS: Mutex<Vec<Option<(Arc<Pending>, WorkerKind)>>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// This worker's slot (`usize::MAX`: none).
@@ -165,13 +165,13 @@ struct Compile {
 }
 
 impl Compile {
-    fn begin(slot: usize, p: &Arc<Pending>, screens_only: bool) -> Compile {
+    fn begin(slot: usize, p: &Arc<Pending>, kind: WorkerKind) -> Compile {
         if slot < MAX_SLOTS && guard_on() {
             let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if jobs.len() < MAX_SLOTS {
                 jobs.resize(MAX_SLOTS, None);
             }
-            jobs[slot] = Some((p.clone(), screens_only));
+            jobs[slot] = Some((p.clone(), kind));
             COMPILING.set(true);
         }
         Compile { slot }
@@ -594,6 +594,15 @@ impl Queue {
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
+
+    /// Takes only a pipeline an active draw or screen pass is waiting on right
+    /// now (never background `early` prewarm entries), so fast workers stay
+    /// completely asleep during intro videos and steady scenes.
+    fn pop_requested(&mut self) -> Option<Arc<Pending>> {
+        let p = self.screen.pop_front().or_else(|| self.requested.pop_front())?;
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        Some(p)
+    }
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -624,11 +633,26 @@ fn start(p: &Arc<Pending>, priority: u8) {
 
 /// Workers that make passes over the screen alone, besides the others.
 const SCREEN_WORKERS: usize = 2;
+/// Workers at `BELOW_NORMAL` that take only `REQUESTED` / `screen` pipelines so
+/// active cutscene & gameplay draws compile immediately without starving videos.
+const FAST_REQUEST_WORKERS: usize = 3;
 
-fn next(screens_only: bool) -> Arc<Pending> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerKind {
+    General,
+    ScreensOnly,
+    RequestedOnly,
+}
+
+fn next(kind: WorkerKind) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        let found = match kind {
+            WorkerKind::RequestedOnly => queue.pop_requested(),
+            WorkerKind::ScreensOnly => queue.pop(true, slow_limit()),
+            WorkerKind::General => queue.pop(false, slow_limit()),
+        };
+        if let Some(p) = found {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -659,8 +683,15 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();
-        for i in 0..workers + screens {
-            if spawn_worker(i >= workers) {
+        for i in 0..workers + screens + FAST_REQUEST_WORKERS {
+            let kind = if i < workers {
+                WorkerKind::General
+            } else if i < workers + screens {
+                WorkerKind::ScreensOnly
+            } else {
+                WorkerKind::RequestedOnly
+            };
+            if spawn_worker(kind) {
                 running = true;
             }
         }
@@ -668,18 +699,18 @@ fn workers() -> bool {
     })
 }
 
-/// Starts one worker: one for passes over the screen alone, or one of the
-/// others.
-fn spawn_worker(screens_only: bool) -> bool {
+/// Starts one worker of `kind`.
+fn spawn_worker(kind: WorkerKind) -> bool {
     let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{slot}"))
         .spawn(move || {
             WORKER_SLOT.set(slot);
-            // Below the title's own threads (loading, recording),
-            // and the streaming one, which is below normal itself
-            // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-            let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+            // General prewarm workers stay at LOWEST so videos & streaming run
+            // untouched; screen & requested-only workers run at BELOW_NORMAL so
+            // draws an active cutscene/frame asks for compile immediately.
+            let lowest = kind == WorkerKind::General
+                && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
             // SAFETY: a plain call on our own thread.
             unsafe {
                 use windows::Win32::System::Threading::*;
@@ -687,11 +718,11 @@ fn spawn_worker(screens_only: bool) -> bool {
                 let _ = SetThreadPriority(GetCurrentThread(), priority);
             }
             loop {
-                let p = next(screens_only);
+                let p = next(kind);
                 {
                     // (If the compiler crashes in here this thread never
                     // returns: `lost` does what follows for it.)
-                    let _compile = Compile::begin(slot, &p, screens_only);
+                    let _compile = Compile::begin(slot, &p, kind);
                     p.make();
                 }
                 if p.was_slow.load(Ordering::Relaxed) {

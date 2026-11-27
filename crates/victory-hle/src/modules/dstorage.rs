@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -320,9 +319,25 @@ struct Files {
     io: Io,
 }
 
+fn dstorage_worker_count() -> usize {
+    if let Some(n) = std::env::var("VICTORY_DSTORAGE_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.min(32);
+    }
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    if victory_gpu::tight_host_ram() {
+        cpus.min(8)
+    } else {
+        cpus
+    }
+}
+
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = dstorage_worker_count();
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
@@ -429,18 +444,13 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
     })
 }
 
-/// A read past the file cache: of the whole sectors around the bytes, into
-/// a buffer of this thread's, unless `out` takes them as they are.
+/// A read past the file cache: always staged into this thread's 4096-aligned
+/// unguarded buffer and copied into `out` in user mode so `FILE_FLAG_NO_BUFFERING`
+/// kernel DMA never fails on aliased section views or GPU write-guard pages.
 fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    /// Every disk's sectors are at most this; offsets, sizes and addresses
-    /// are multiples of it.
     const SECTOR: usize = 4096;
-    /// Read at a time.
-    const MOST: usize = 1 << 20;
+    const MOST: usize = 4 << 20;
     let sector = SECTOR as u64;
-    if offset.is_multiple_of(sector) && out.len().is_multiple_of(SECTOR) && (out.as_ptr() as usize).is_multiple_of(SECTOR) {
-        return read_overlapped(file, out, offset);
-    }
     thread_local! {
         static BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; MOST + SECTOR]);
     }
@@ -628,7 +638,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = dstorage_worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -1406,22 +1416,39 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+    // The console's order: zlib first, then BCPack. Reuse per-worker scratch
+    // buffers so multi-megabyte compressed streams and intermediate packed
+    // blocks never churn OS VirtualAlloc/VirtualFree or cross-core TLB flushes.
+    if bc != 0 && options & ZLIB != 0 {
+        thread_local! {
+            static PACKED_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        PACKED_SCRATCH.with_borrow_mut(|packed| {
+            let need = request.intermediate_size as usize;
+            if packed.len() < need {
+                packed.resize(need, 0);
+            }
+            let n = with_source(request, |source| inflate(source, &mut packed[..need]))
+                .map_err(|hr| fail(hr, "reading or inflating the source"))?;
+            let res = into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, &packed[..n], out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => unreachable!(),
+            });
+            trim_scratch(packed);
+            res
+        })?;
     } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+        with_source(request, |source| {
+            into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, source, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        })?;
+    }
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1518,18 +1545,37 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn trim_scratch(buf: &mut Vec<u8>) {
+    if buf.capacity() > (16 << 20) {
+        buf.truncate(4 << 20);
+        buf.shrink_to(4 << 20);
+    }
+}
+
+/// Runs `f` on a compressed request's source: borrowed directly from memory, or
+/// read from the file into this worker thread's reusable scratch buffer.
+fn with_source<R>(
+    request: &Request,
+    f: impl FnOnce(&[u8]) -> Result<R, HRESULT>,
+) -> Result<R, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return f(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    thread_local! {
+        static SOURCE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SOURCE_SCRATCH.with_borrow_mut(|bytes| {
+        if bytes.len() < size {
+            bytes.resize(size, 0);
+        }
+        let read_res = read_into(request, &mut bytes[..size]);
+        let res = read_res.and_then(|()| f(&bytes[..size]));
+        trim_scratch(bytes);
+        res
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1655,44 +1701,50 @@ fn into_pages(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a moment (commit
-    // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
-    });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+    thread_local! {
+        static PAGE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    if written {
-        super::xmem::pages_written(pages, offset, n);
-        if tries > 0 {
-            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+    PAGE_SCRATCH.with_borrow_mut(|data| {
+        if data.len() < len {
+            data.resize(len, 0);
         }
-        Ok(())
-    } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+        let n = match fill(&mut data[..len]) {
+            Ok(n) => n,
+            Err(hr) => {
+                trim_scratch(data);
+                return Err(hr);
+            }
+        };
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        });
+        let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+        let mut tries = 0;
+        while !written && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+            tries += 1;
+            written = super::xmem::write_physical(pages, offset, &data[..n]);
+        }
+        trim_scratch(data);
+        if written {
+            super::xmem::pages_written(pages, offset, n);
+            if tries > 0 {
+                tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+            }
+            Ok(())
+        } else {
+            let known = super::xmem::pages_known(pages, offset, len);
+            tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+            tracing::warn!(
+                offset,
+                len,
+                pages = pages.len(),
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            );
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// The page numbers `list` holds now, one per 64 KiB of destination.

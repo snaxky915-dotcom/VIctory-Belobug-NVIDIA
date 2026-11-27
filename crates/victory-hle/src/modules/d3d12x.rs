@@ -93,6 +93,12 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Flushes background shader cache writes and saves the host pipeline library.
+pub fn save_pipeline_cache() {
+    #[cfg(windows)]
+    victory_gpu::pipeline::save_pipeline_cache();
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

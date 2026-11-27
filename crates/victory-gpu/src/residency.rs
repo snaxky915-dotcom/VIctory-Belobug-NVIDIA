@@ -35,7 +35,38 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static CARD_PRESSURED: AtomicBool = AtomicBool::new(false);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_CARD_GUARD=0` disables DXGI local VRAM / non-local shared GPU memory
+/// pressure checks (on by default when `VICTORY_RESIDENCY=1`).
+fn card_guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// True on hosts with `<= 18 GiB` of physical RAM (e.g. 16 GB laptops/PCs),
+/// regardless of `VICTORY_RESIDENCY`, so pool defaults stay sized for 16 GB.
+pub fn tight_host_ram() -> bool {
+    static TIGHT: OnceLock<bool> = OnceLock::new();
+    *TIGHT.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 18 * GIB))
+}
+
+fn sample_card_pressure() -> bool {
+    if !card_guard_on() {
+        return false;
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    // [local_budget, local_usage, non_local_budget, non_local_usage]
+    let Some([lb, lu, nlb, nlu]) = host.video_memory() else {
+        return false;
+    };
+    let local_full = lb > 0 && lu.saturating_mul(100) >= lb.saturating_mul(90);
+    let shared_full = nlb > 0 && nlu.saturating_mul(100) >= nlb.saturating_mul(85);
+    local_full || shared_full
+}
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
@@ -65,9 +96,11 @@ fn sample_commit(now: u64) -> u64 {
         && NEXT_COMMIT_SAMPLE
             .compare_exchange(next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-        && let Some(status) = memory_status()
     {
-        AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        if let Some(status) = memory_status() {
+            AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        }
+        CARD_PRESSURED.store(sample_card_pressure(), Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
@@ -110,7 +143,11 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    let commit = sample_commit(now);
+    if !bake && CARD_PRESSURED.load(Ordering::Relaxed) {
+        return false;
+    }
+    has_growth_reserve(commit, bake)
 }
 
 pub(crate) fn limited_host_ram() -> bool {
@@ -121,8 +158,18 @@ pub(crate) fn limited_host_ram() -> bool {
     })
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
-    if was {
+fn next_pressure(was: bool, physical: u64, commit: u64, tight: bool) -> bool {
+    if tight {
+        // On 16 GB RAM hosts (~15.7 GiB usable), Windows normally sits at
+        // 1.4–2.9 GiB of free physical RAM even with 10+ GiB of free commit;
+        // triggering pressure at <= 3 GiB physical kept pressure stuck on for
+        // the entire run and starved scene/cutscene texture streaming.
+        if was {
+            physical < 1920 * MIB || commit < 4608 * MIB
+        } else {
+            physical <= 1280 * MIB || commit <= 3072 * MIB
+        }
+    } else if was {
         physical < 5 * GIB || commit < 6 * GIB
     } else {
         physical <= 3 * GIB || commit <= 4 * GIB
@@ -137,8 +184,10 @@ pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    let card_hot = sample_card_pressure();
+    CARD_PRESSURED.store(card_hot, Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = card_hot || next_pressure(was, physical, commit, tight_host_ram());
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -175,7 +224,9 @@ pub(crate) fn critical_commit() -> bool {
         return false;
     }
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed)
+        || sample_commit(now) < 1536 * MIB
+        || CARD_PRESSURED.load(Ordering::Relaxed)
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
@@ -211,12 +262,18 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_pressure(false, 12 * GIB, 4 * GIB, false));
+        assert!(next_pressure(false, 3 * GIB, 16 * GIB, false));
+        assert!(next_pressure(true, 4 * GIB, 7 * GIB, false));
+        assert!(next_pressure(true, 6 * GIB, 5 * GIB, false));
+        assert!(!next_pressure(true, 5 * GIB, 6 * GIB, false));
+        assert!(!next_pressure(false, 4 * GIB, 5 * GIB, false));
+
+        // 16 GB host thresholds: ~2.9 GiB free physical + 11.5 GiB commit stays unpressured
+        assert!(!next_pressure(false, 2986 * MIB, 11855 * MIB, true));
+        assert!(next_pressure(false, 1280 * MIB, 11855 * MIB, true));
+        assert!(next_pressure(false, 2986 * MIB, 3072 * MIB, true));
+        assert!(!next_pressure(true, 1920 * MIB, 4608 * MIB, true));
     }
 
     #[test]

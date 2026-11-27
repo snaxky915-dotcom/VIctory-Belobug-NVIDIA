@@ -77,7 +77,7 @@ pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]
-mod residency;
+pub mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -130,6 +130,8 @@ pub fn frame_phase() -> u32 {
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+#[cfg(windows)]
+pub use residency::tight_host_ram;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

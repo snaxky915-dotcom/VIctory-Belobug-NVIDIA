@@ -27,6 +27,12 @@ const IID_IDXC_VALIDATOR: Guid = Guid(
     0x4826,
     [0x98, 0x11, 0x28, 0x57, 0xe7, 0x97, 0xf4, 0x9a],
 );
+const IID_IDXC_VERSION_INFO: Guid = Guid(
+    0xb04f_5b50,
+    0x2059,
+    0x4f12,
+    [0xa8, 0xff, 0xa1, 0xe0, 0xcd, 0xe1, 0xcc, 0x7e],
+);
 /// `DxcValidatorFlags_InPlaceEdit`: sign the container we pass.
 const IN_PLACE_EDIT: u32 = 1;
 
@@ -155,9 +161,26 @@ impl Validator {
             if hr < 0 || object.is_null() {
                 return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
             }
-            Ok(Validator {
-                object: object.cast(),
-            })
+            let object: Object = object.cast();
+            let mut ver_obj = std::ptr::null_mut();
+            let qi: unsafe extern "system" fn(Object, *const Guid, *mut *mut c_void) -> Hresult =
+                method(object, 0);
+            if qi(object, &IID_IDXC_VERSION_INFO, &mut ver_obj) >= 0 && !ver_obj.is_null() {
+                let ver_obj: Object = ver_obj.cast();
+                let mut major = 0u32;
+                let mut minor = 0u32;
+                let get_ver: unsafe extern "system" fn(Object, *mut u32, *mut u32) -> Hresult =
+                    method(ver_obj, 3);
+                let vhr = get_ver(ver_obj, &mut major, &mut minor);
+                release(ver_obj);
+                if vhr >= 0 && (major, minor) < (1, 6) {
+                    release(object);
+                    return Err(format!(
+                        "dxil.dll validator {major}.{minor} is older than 1.6 (SM 6.6 required)"
+                    ));
+                }
+            }
+            Ok(Validator { object })
         }
     }
 

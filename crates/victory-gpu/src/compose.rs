@@ -30,7 +30,11 @@ V vs(uint id : SV_VertexID) {
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    float3 c = saturate(o.rgb + s.rgb * (1 - saturate(o.a)));
+    float n1 = frac(52.9829189 * frac(dot(v.at.xy, float2(0.06711056, 0.00583715))));
+    float n2 = frac(52.9829189 * frac(dot(v.at.xy + float2(17.0, 31.0), float2(0.06711056, 0.00583715))));
+    c = saturate(c + (n1 + n2 - 1.0) * (0.5 / 255.0));
+    return float4(c, 1);
 }
 "#;
 

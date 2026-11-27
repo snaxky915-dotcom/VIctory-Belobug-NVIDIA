@@ -13,11 +13,17 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_slices(converter, &[input])
+    }
+
+    pub fn from_slices(converter: &dyn Converter, slices: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        for slice in slices {
+            h.update(slice);
+        }
         CacheKey(h.finalize())
     }
 
@@ -42,8 +48,33 @@ impl Cache {
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
-        let hex = key.to_hex();
-        self.root.join(&hex[..2]).join(&hex[2..])
+        let hex = key.0.to_hex();
+        let hex_str = hex.as_str();
+        self.root.join(&hex_str[..2]).join(&hex_str[2..])
+    }
+
+    /// Atomically publishes pre-encoded `output` bytes under `key`.
+    pub fn write_entry(&self, key: &CacheKey, output: &[u8]) -> Result<PathBuf> {
+        let path = self.path_for(key);
+        let dir = path.parent().expect("hashed path has a parent");
+        // Write-then-rename so readers never see partial output; only walk and
+        // create `dir` on the very first write into that hex shard.
+        let (tmp, mut file) = match tempfile_in(dir) {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir)?;
+                tempfile_in(dir)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let written = file.write_all(output);
+        drop(file);
+        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        published?;
+        Ok(path)
     }
 
     /// Returns the cached output for `input`, converting it first if needed.
@@ -57,18 +88,7 @@ impl Cache {
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
-        let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
-        let (tmp, mut file) = tempfile_in(dir)?;
-        let written = file.write_all(&output);
-        drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        published?;
-        Ok(path)
+        self.write_entry(&key, &output)
     }
 }
 

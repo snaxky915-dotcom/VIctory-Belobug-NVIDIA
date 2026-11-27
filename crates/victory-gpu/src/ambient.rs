@@ -335,13 +335,16 @@ RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
 }
-uint pack(float3 c) {
+uint pack_dithered(float3 c, float2 p) {
     c = clamp(c, 0.0, 65408.0);
     float top = max(c.r, max(c.g, c.b));
     int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
     float scale = exp2(float(24 - e));
-    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
-    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    float d1 = frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+    float d2 = frac(52.9829189 * frac(dot(p + float2(19.0, 47.0), float2(0.06711056, 0.00583715))));
+    float dither = 0.5 + (d1 + d2 - 1.0) * 0.5;
+    if (top * scale + dither >= 512.0) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(max(c * scale + dither, 0.0)), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
 [RootSignature(RS)]
@@ -377,7 +380,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 found;
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
-        light[p] = pack(found);
+        light[p] = pack_dithered(found, float2(p));
         return;
     }
     // Between the four points around, those at its own depth first; which
@@ -415,8 +418,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    float3 written = max(was, found);
-    light[p] = pack(written);
+    // Smoothly blend clamped probe leftovers instead of hard per-tile max() so
+    // uninitialized 16x16 screen-probe tiles never form blocky patches on skin/hair.
+    float3 written = lerp(found, max(was, found), 0.35);
+    // Gentle indoor perceptual floor so unlit rooms without RT never crush to pitch black.
+    written = max(written, float3(0.0055, 0.0054, 0.0052) * level * open);
+    light[p] = pack_dithered(written, float2(p));
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
         stats.InterlockedAdd(0, 1, ignored);
@@ -570,7 +577,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    static MOST_CAP: OnceLock<f32> = OnceLock::new();
+    let most_cap = *MOST_CAP.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .unwrap_or(1.15)
+    });
+    words[9] = most_cap.to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();

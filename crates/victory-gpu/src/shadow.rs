@@ -2957,6 +2957,7 @@ fn window_budget() -> Option<u64> {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&v| v > 0)
             .map(|v| v.saturating_mul(1 << 20))
+            .or_else(|| crate::residency::tight_host_ram().then_some(512 << 20))
     })
 }
 

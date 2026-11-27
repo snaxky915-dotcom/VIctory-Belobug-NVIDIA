@@ -704,10 +704,23 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    #[cfg(windows)]
+                    // SAFETY: plain Win32 timer-resolution and thread-priority calls for real-time audio.
+                    unsafe {
+                        #[link(name = "winmm")]
+                        unsafe extern "system" {
+                            fn timeBeginPeriod(uPeriod: u32) -> u32;
+                        }
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                        };
+                        let _ = timeBeginPeriod(1);
+                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                    }
                     loop {
                         xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono; 1 ms timer keeps rings fed.
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
