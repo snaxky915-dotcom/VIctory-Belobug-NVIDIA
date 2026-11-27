@@ -174,16 +174,15 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
     let share = |percent: u64| budget / 100 * percent;
     // On <= 6 GiB VRAM budgets (e.g. RTX 4050 6 GB laptop with 5.0 GiB WDDM
-    // budget), keep total local usage around 74-80% (~3.7-4.0 GiB) so render
-    // targets + 256 MB card buffers + active textures never spill over the
-    // 5.0 GiB budget into slow PCIe shared memory.
+    // budget), start evicting idle textures early so total local usage stays
+    // comfortably below 4.5 GiB (never spilling past 5.0 GiB into PCIe RAM).
     if budget <= (6 << 30) {
-        if used < share(76) {
-            return (30_000, u64::MAX);
-        } else if used < share(85) {
-            return (2_500, used - share(72));
+        if used < share(68) {
+            return (20_000, u64::MAX);
+        } else if used < share(78) {
+            return (2_000, used - share(64));
         } else {
-            return (1_200, used - share(74));
+            return (1_000, used - share(66));
         }
     }
     if used < share(85) {

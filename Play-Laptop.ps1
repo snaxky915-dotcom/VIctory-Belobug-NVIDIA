@@ -5,12 +5,12 @@ param(
     [ValidateSet(6, 7)][int]$Upscaler = 6,
     [string]$RenderScale = '0.55',
     [ValidateSet(0, 30, 40, 60)][int]$TargetFps = 60,
-    [ValidateRange(64, 1536)][int]$CardBuffersMB = 256,
-    [ValidateRange(0, 6144)][int]$TextureBudgetMB = 2200,
-    [ValidateRange(10, 100)][int]$MeshLimitPct = 70,
+    [ValidateRange(64, 1536)][int]$CardBuffersMB = 128,
+    [ValidateRange(0, 6144)][int]$TextureBudgetMB = 2048,
+    [ValidateRange(10, 100)][int]$MeshLimitPct = 100,
     [ValidateRange(1, 16)][int]$MaxAniso = 4,
     [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
-    [ValidateRange(50, 90)][int]$TextureRoomPct = 82,
+    [ValidateRange(50, 90)][int]$TextureRoomPct = 78,
     [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'info',
     [string]$LogFile = '',
     [switch]$LevelsOnDemand,
@@ -84,8 +84,7 @@ $defaults = @{
     VICTORY_VSYNC                    = if ($Vsync) { '1' } else { '0' }
     VICTORY_MAX_ANISO                = "$MaxAniso"
     VICTORY_MESH_LIMIT_PERCENT       = "$MeshLimitPct"
-    # tiles.rs defaults to OFF; pass -LevelsOnDemand only to test mip-on-demand VRAM savings
-    VICTORY_LEVELS_ON_DEMAND         = if ($LevelsOnDemand) { '1' } else { '0' }
+    # VICTORY_LEVELS_ON_DEMAND omitted by default (only set if -LevelsOnDemand is passed)
     VICTORY_PORT_CONSTANTS           = if ($PortConstants -and -not $Safe) { '1' } else { '0' }
     VICTORY_PORT_DESCRIPTORS         = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_CBV                 = if ($Safe) { '0' } else { '1' }
@@ -136,6 +135,9 @@ $defaults = @{
     VICTORY_D3D12_DRED               = 'faults'
 }
 
+if ($LevelsOnDemand) {
+    $defaults['VICTORY_LEVELS_ON_DEMAND'] = '1'
+}
 if ($TextureBudgetMB -gt 0) {
     $defaults['VICTORY_TEXTURE_BUDGET_MB'] = "$TextureBudgetMB"
 }
