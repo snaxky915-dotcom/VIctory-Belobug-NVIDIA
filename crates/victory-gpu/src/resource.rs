@@ -1802,7 +1802,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // budget overrun (PCIe spill).
         Some([budget, used, ..]) => {
             let room_credit = crate::pool::texture_room().min(budget / 10);
-            let hard_pct = if budget <= (6 << 30) { 92 } else { 96 };
+            let hard_pct = if budget <= (6 << 30) { 95 } else { 96 };
             used < budget / 100 * hard_pct
                 && used.saturating_sub(room_credit) + crate::shadow::card_room_kept() + targets_room_kept()
                     < budget / 100 * room_percent()

@@ -63,7 +63,7 @@ fn sample_card_pressure() -> bool {
     let Some([lb, lu, nlb, nlu]) = host.video_memory() else {
         return false;
     };
-    let local_full = lb > 0 && lu.saturating_mul(100) >= lb.saturating_mul(90);
+    let local_full = lb > 0 && lu.saturating_mul(100) >= lb.saturating_mul(94);
     let shared_full = nlb > 0 && nlu.saturating_mul(100) >= nlb.saturating_mul(85);
     local_full || shared_full
 }
