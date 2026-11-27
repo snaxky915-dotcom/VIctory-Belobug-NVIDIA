@@ -1,9 +1,12 @@
-# Tuned VIctory-Belobug launcher for hybrid NVIDIA laptop (i7-12650H 6P+4E, RTX 4050 6 GB, 16 GB RAM, NVMe SSD).
-# Automatically saves EVERY log line (INFO + WARN + ERROR + frame/memory/shader telemetry) into .\logs\run-*.log and .\logs\latest.log.
+﻿# Tuned VIctory-Belobug launcher for hybrid NVIDIA laptop (i7-12650H 6P+4E, RTX 4050 6 GB, 16 GB RAM, NVMe SSD).
+# Saves logs into .\logs\run-*.log and .\logs\latest.log using a single buffered StreamWriter (no per-line file reopen stalls).
 param(
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
+    [ValidateSet('1280x720', '1600x900', '1920x1080')][string]$DisplayMode = '1920x1080',
+    [ValidateSet(0, 30, 40, 60)][int]$TargetFps = 60,
     [ValidateRange(64, 1536)][int]$CardBuffersMB = 512,
-    [ValidateSet('info', 'warn', 'debug')][string]$LogLevel = 'info',
+    [ValidateRange(0, 850)][int]$PipelineWaitMs = 16,
+    [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'warn',
     [string]$LogFile = '',
     [switch]$Hud,
     [switch]$Kbm,
@@ -30,7 +33,7 @@ if (-not $exe) {
     exit 2
 }
 
-# Clean any leftover VICTORY_* overrides from the current shell (keep path vars)
+# Clean leftover VICTORY_* overrides from the current shell (keep path vars)
 $keepVars = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $keepVars } | ForEach-Object {
     Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
@@ -38,17 +41,13 @@ Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Na
 
 $defaults = @{
     VICTORY_D3D12_ADAPTER            = 'NVIDIA'
-    # Keep on-demand tiled texture levels OFF so texture mips always upload completely
+    VICTORY_DISPLAY_MODE             = $DisplayMode
     VICTORY_LEVELS_ON_DEMAND         = '0'
-    # Renderer Ports: keep Port 1 OFF on laptop PCIe x8 so 174 MB skinning/constants heap lives in fast GDDR6 VRAM!
-    # Keep Ports 2, 5, 6, 7 ON (zero PCIe penalty, ~40 ms CPU savings + keeps warm pipeline library!)
     VICTORY_PORT_CONSTANTS           = '0'
     VICTORY_PORT_DESCRIPTORS         = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_CBV                 = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_GUARD               = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_JOURNAL             = if ($Safe) { '0' } else { '1' }
-    # Balanced 5.0 GiB Local VRAM budget: vram_keep trims old idle scene textures at >=76% (3.8 GiB)
-    # while room_percent=90% (4.5 GiB) + targets=1100MB ensures active face/cutscene textures NEVER lock out!
     VICTORY_RESIDENCY                = '1'
     VICTORY_CARD_GUARD               = '1'
     VICTORY_TEXTURE_ROOM_PERCENT     = '90'
@@ -56,15 +55,14 @@ $defaults = @{
     VICTORY_CARD_ROOM_FOR_BUFFERS    = '0'
     VICTORY_INDIRECT_REST            = '0'
     VICTORY_XMA_REFILL               = '1'
-    # Smooth indoor/cutscene lighting without 16x16 probe tile blocks or milky haze
     VICTORY_AMBIENT                  = '0.85'
     VICTORY_AMBIENT_MOST             = '1.15'
     VICTORY_AMBIENT_AIR              = '1.4'
     VICTORY_AMBIENT_SETTLE           = '250,3'
-    # Fast cutscene pipeline wait budget (dedicated BELOW_NORMAL request workers compile active scene draws immediately)
-    VICTORY_PIPELINE_WAIT_MS         = '850'
+    VICTORY_PIPELINE_WAIT_MS         = "$PipelineWaitMs"
     VICTORY_SCREEN_WAIT_MS           = '10000'
-    # Async multithreaded GPU submission & 6P+4E CPU balance
+    VICTORY_D3D12_BACKGROUND         = '0'
+    VICTORY_LANE_CORE                = '1'
     VICTORY_TEXTURE_NO_WAIT          = '1'
     VICTORY_RELAY                    = '2'
     VICTORY_WIDE_BACK                = '1'
@@ -82,9 +80,8 @@ $defaults = @{
     VICTORY_THIN_THREADS             = '6'
     VICTORY_JOIN_PARTS               = '6'
     VICTORY_UPLOAD_AHEAD             = if ($Safe) { '0' } else { '1' }
-    # GDDR6 Card Buffers (512 MB holds 174 MB skinning heap + active world vertex/meshlet buffers in 192 GB/s VRAM)
     VICTORY_SUBMIT_DEPTH             = '16'
-    VICTORY_LATE_WAIT_LISTS          = '96'
+    VICTORY_LATE_WAIT_LISTS          = '192'
     VICTORY_WINDOW_KB                = '256'
     VICTORY_WINDOW_TAILS             = '1'
     VICTORY_CARD_BUFFERS_MIN_KB      = '64'
@@ -92,13 +89,21 @@ $defaults = @{
     VICTORY_WINDOW_BUDGET_MB         = '512'
     VICTORY_DSTORAGE_IO              = 'direct'
     VICTORY_DSTORAGE_WORKERS         = '8'
-    # Default 'info' logs EVERY per-second FPS/GPU/CPU/VRAM/RAM frame line, shader/PSO stats, dstorage, and all warnings/errors
     VICTORY_LOG                      = $LogLevel
-    VICTORY_CARD_ACCOUNTING          = '1'
-    VICTORY_D3D12_DRED               = 'light'
+    VICTORY_CARD_ACCOUNTING          = if ($LogLevel -eq 'warn') { '0' } else { '1' }
+    VICTORY_D3D12_DRED               = 'faults'
 }
+
+if ($TargetFps -eq 60) {
+    $defaults['VICTORY_FRAME_INTERVAL_MS'] = '16.667'
+} elseif ($TargetFps -eq 40) {
+    $defaults['VICTORY_FRAME_INTERVAL_MS'] = '25.0'
+} elseif ($TargetFps -eq 0) {
+    $defaults['VICTORY_FRAME_INTERVAL_MS'] = '0'
+}
+
 if ($Console -eq 'series-x') {
-    $defaults['VICTORY_OUTPUT'] = '1920x1080'
+    $defaults['VICTORY_OUTPUT'] = $DisplayMode
 }
 if ($Hud) {
     $defaults['VICTORY_PANEL'] = '1'
@@ -133,7 +138,7 @@ try {
 $header = @(
     "================================================================================"
     "VIctory-Belobug NVIDIA Run Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
-    "Console: $Console | CardBuffersMB: $CardBuffersMB | LogLevel: $LogLevel | Safe: $Safe | Power: $powerState"
+    "Console: $Console | DisplayMode: $DisplayMode | TargetFps: $TargetFps | CardBuffersMB: $CardBuffersMB | LogLevel: $LogLevel | Safe: $Safe | Power: $powerState"
     "Executable: $($exe.FullName)"
     "Runner: $runner"
     "--- VICTORY_* Environment ---"
@@ -148,27 +153,34 @@ $header += @(
     ""
 )
 $header | Set-Content -Path $runLog -Encoding UTF8
-Copy-Item -Path $runLog -Destination $latestLog -Force
 
-Write-Host "Launching $($exe.Name) [VIctory-Belobug NVIDIA | $Console | CardBuffers=${CardBuffersMB}MB | Ports=2,5,6,7]" -ForegroundColor Cyan
-Write-Host "Guardando log completo en: $runLog (y copia en $latestLog)" -ForegroundColor Green
+Write-Host "Launching $($exe.Name) [VIctory-Belobug NVIDIA | $Console | $DisplayMode | ${TargetFps}FPS | CardBuffers=${CardBuffersMB}MB]" -ForegroundColor Cyan
+Write-Host "Guardando log en: $runLog (y copia al cerrar en $latestLog)" -ForegroundColor Green
 
-# Stream all stdout + stderr live to console AND append every single line to $runLog (works cleanly in PowerShell 5.1 without NativeCommandError)
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
+$exitCode = 1
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$writer = New-Object System.IO.StreamWriter($runLog, $true, $utf8NoBom)
+$writer.AutoFlush = $true
 try {
     & $runner run $exe.FullName --console $Console --execute 2>&1 | ForEach-Object {
         $line = "$_"
-        Write-Host $line
-        Add-Content -Path $runLog -Value $line -Encoding UTF8
+        $writer.WriteLine($line)
+        if ($LogLevel -ne 'warn' -or $line -match 'WARN|ERROR|fps|panic|removed') {
+            Write-Host $line
+        }
     }
     $exitCode = $LASTEXITCODE
 } finally {
+    if ($null -ne $writer) {
+        $writer.WriteLine("`n================================================================================")
+        $writer.WriteLine("Exited at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') with code $exitCode")
+        $writer.Dispose()
+    }
     $ErrorActionPreference = $prevEap
 }
 
-$footer = "`n================================================================================`nExited at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') with code $exitCode`n"
-Add-Content -Path $runLog -Value $footer -Encoding UTF8
 Copy-Item -Path $runLog -Destination $latestLog -Force
-Write-Host "Sesion terminada (codigo $exitCode). Log completo guardado en: $latestLog" -ForegroundColor Green
+Write-Host "Sesion terminada (codigo $exitCode). Log guardado en: $latestLog" -ForegroundColor Green
 exit $exitCode
