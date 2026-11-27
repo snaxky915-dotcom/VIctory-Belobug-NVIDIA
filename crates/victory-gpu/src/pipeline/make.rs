@@ -59,8 +59,21 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let is_bake = shaders.iter().any(|s| {
+            let h = s.hash.as_str();
+            crate::draw::BAKE_PIXEL_SHADERS.contains(&h)
+                || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+        });
+        let is_mrt_atlas_bake = graphics.as_ref().is_some_and(|g| {
+            g.targets.NumRenderTargets >= 4
+                && (g.depth_format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN
+                    || !g.depth.DepthEnable.as_bool())
+        });
         Pending {
-            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            // One-shot ped/face/decoration bakes (including mesh-shader and 4+ MRT
+            // atlas compositors) must never be dropped on a tight per-frame wait
+            // budget, or the baked character skin/albedo target stays black.
+            screen: is_bake || is_mrt_atlas_bake || graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),

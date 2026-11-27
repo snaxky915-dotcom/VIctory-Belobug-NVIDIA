@@ -9,7 +9,7 @@ param(
     [ValidateRange(0, 6144)][int]$TextureBudgetMB = 0,
     [ValidateRange(10, 100)][int]$MeshLimitPct = 100,
     [ValidateRange(1, 16)][int]$MaxAniso = 2,
-    [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
+    [ValidateRange(0, 850)][int]$PipelineWaitMs = 400,
     [ValidateRange(50, 92)][int]$TextureRoomPct = 88,
     [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'warn',
     [string]$LogFile = '',
@@ -94,7 +94,7 @@ $defaults = @{
     VICTORY_RESIDENCY                = '1'
     VICTORY_CARD_GUARD               = '1'
     VICTORY_TEXTURE_ROOM_PERCENT     = "$TextureRoomPct"
-    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1200'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '950'
     VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
     VICTORY_INDIRECT_REST            = '0'
     VICTORY_XMA_REFILL               = '1'
