@@ -437,6 +437,10 @@ pub struct Structured {
     /// Blocks whose closing branch the whole wave takes together ([`structure_wide`]): its
     /// `when` is still the lane's own bit; the wave goes by all of them.
     pub wide: HashSet<usize>,
+    /// Scalar mask SCC branches emitted wave-wide. Their edges give no facts
+    /// about a lane's own bit. Kept apart from supplied `wide` branches so
+    /// the lowerer's existing convergence checks for exchanges stay conservative.
+    pub wave_scc: HashSet<usize>,
     /// Per block closed by a branch on a lane mask: whether the console takes it when some
     /// lane's `when` holds (`true`) or when every lane's does (`false`).
     pub wave_any: Vec<Option<bool>>,
@@ -453,6 +457,26 @@ impl Structured {
         }
         .copied()
     }
+}
+
+thread_local! {
+    /// Set by [`with_per_lane`]: no branch is taken wave-wide of its own accord.
+    static PER_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the branches on a mask operation's SCC split per lane, each lane by its own
+/// bit ([`Structured::wave_scc`] left empty), as before #66: inexact where an arm runs lanes
+/// whose own bit went the other way, but a program whose wave-wide form does not translate
+/// is drawn instead of dropped (`emit::emit`).
+pub fn with_per_lane<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PER_LANE.set(self.0);
+        }
+    }
+    let _restore = Restore(PER_LANE.replace(true));
+    f()
 }
 
 /// Builds the per-lane form of `program`.
@@ -532,6 +556,8 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// See [`Structured::wide`].
     wide: HashSet<usize>,
+    /// See [`Structured::wave_scc`].
+    wave_scc: HashSet<usize>,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
     scc_every: HashSet<Value>,
@@ -615,6 +641,7 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             wide: HashSet::new(),
+            wave_scc: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
         })
@@ -627,6 +654,7 @@ impl<'a> Lanes<'a> {
         self.seen.clear();
         self.scc_lane.clear();
         self.scc_every.clear();
+        self.wave_scc.clear();
         self.wave_any.fill(None);
         self.joins.clear();
         self.phi_joins.clear();
@@ -687,6 +715,16 @@ impl<'a> Lanes<'a> {
             {
                 self.when[b] = Some(self.branch(last));
                 self.wave_any[b] = self.wave_kind(last);
+                if !PER_LANE.get()
+                    && matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                    && let Some(scc) = last.read(Reg::Scc)
+                    && self.scc_lane.contains_key(&scc)
+                    && !self.scc_every.contains(&scc)
+                    && let Some(&(writer, index)) = self.defs.get(&scc)
+                    && p.blocks[writer].insts[index].write(Reg::S(EXEC)).is_none()
+                {
+                    self.wave_scc.insert(b);
+                }
             }
         }
         execs
@@ -694,7 +732,7 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
-        if self.wide.contains(&q) {
+        if self.wide.contains(&q) || self.wave_scc.contains(&q) {
             // the wave's decision: it says nothing about this lane's own bit
             return c;
         }
@@ -860,6 +898,7 @@ impl<'a> Lanes<'a> {
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             wide: self.wide,
+            wave_scc: self.wave_scc,
             wave_any: self.wave_any,
             scc_some: self
                 .scc_lane

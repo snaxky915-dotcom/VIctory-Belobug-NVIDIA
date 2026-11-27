@@ -87,7 +87,15 @@ impl Pending {
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
                 let began = Instant::now();
-                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                let made = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                })) {
+                    Ok(pipeline) => pipeline,
+                    Err(_) => {
+                        tracing::warn!(key = self.key, shaders = ?self.shaders, "host pipeline build panicked");
+                        None
+                    }
+                };
                 super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
                 made
             };

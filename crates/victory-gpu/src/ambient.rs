@@ -425,9 +425,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / max(sum, 1e-6);
     found = any(isnan(found)) || any(isinf(found)) ? 0.0 : clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2);
-    // Soft shadow-toe lift for dark indoor corridors so indirect bounce retains depth
-    // without crushing dark walls or washing out bright rooms.
-    found = max(found, sqrt(max(found, 0.0)) * 0.075);
+    // Soft shadow-toe lift for dark indoor corridors AND soft-shoulder compression
+    // for bright sunlit outdoor scenes so skin/faces never wash out white.
+    found = max(found, sqrt(max(found, 0.0)) * 0.065);
+    found = found / (1.0 + dot(found, LUMA) * 0.9);
     found *= level * open;
     float3 was = unpack(light[p]);
     if (any(isnan(was)) || any(isinf(was)) || any(was > 32.0)) was = 0.0;
