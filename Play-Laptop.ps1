@@ -1,13 +1,16 @@
-﻿# Tuned VIctory-Belobug launcher for hybrid NVIDIA laptop (i7-12650H 6P+4E, RTX 4050 6 GB, 16 GB RAM, NVMe SSD).
-# Saves logs into .\logs\run-*.log and .\logs\latest.log using a single buffered StreamWriter (no per-line file reopen stalls).
+﻿# Tuned VIctory-Belobug launcher for RTX 4050 6 GB / 16 GB RAM (720p + native upscaler 6 + anti-VRAM spill)
 param(
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
-    [ValidateSet('1280x720', '1600x900', '1920x1080')][string]$DisplayMode = '1920x1080',
+    [ValidateSet('1280x720', '1664x936', '1920x1080')][string]$OutputMode = '1280x720',
+    [ValidateSet(6, 7)][int]$Upscaler = 6,
+    [string]$RenderScale = '',
     [ValidateSet(0, 30, 40, 60)][int]$TargetFps = 60,
-    [ValidateRange(64, 1536)][int]$CardBuffersMB = 512,
-    [ValidateRange(0, 850)][int]$PipelineWaitMs = 16,
+    [ValidateRange(64, 1536)][int]$CardBuffersMB = 256,
+    [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
+    [ValidateRange(50, 90)][int]$TextureRoomPct = 75,
     [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'warn',
     [string]$LogFile = '',
+    [switch]$FastLight,
     [switch]$Hud,
     [switch]$Kbm,
     [switch]$Safe
@@ -16,33 +19,28 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 $runner = Join-Path $PSScriptRoot 'target\release\victory.exe'
-if (-not (Test-Path $runner)) {
-    Write-Error "Build target\release\victory.exe first."
-    exit 2
-}
+if (-not (Test-Path $runner)) { Write-Error "Build target\release\victory.exe first."; exit 2 }
 
 $cfgLines = & $runner config
 $gameDir = ($cfgLines | Where-Object { $_ -match '^game_dir\s*:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
-if (-not $gameDir) {
-    Write-Error "Could not read game_dir from victory.toml."
-    exit 2
-}
+if (-not $gameDir) { Write-Error "Could not read game_dir from victory.toml."; exit 2 }
 $exe = Get-ChildItem -Path $gameDir -Filter '*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
-if (-not $exe) {
-    Write-Error "No title executable found in $gameDir"
-    exit 2
-}
+if (-not $exe) { Write-Error "No title executable found in $gameDir"; exit 2 }
 
-# Clean leftover VICTORY_* overrides from the current shell (keep path vars)
 $keepVars = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $keepVars } | ForEach-Object {
     Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
 }
 
+if ($Upscaler -eq 7 -and $OutputMode -ne '1920x1080') {
+    Write-Warning "FSR4 (Upscaler 7) en Series S solo soporta 1920x1080. Usa -Upscaler 6 para $OutputMode."
+}
+
 $defaults = @{
     VICTORY_D3D12_ADAPTER            = 'NVIDIA'
-    VICTORY_DISPLAY_MODE             = $DisplayMode
-    VICTORY_LEVELS_ON_DEMAND         = '0'
+    VICTORY_OUTPUT                   = $OutputMode
+    VICTORY_UPSCALER                 = "$Upscaler"
+    # VICTORY_LEVELS_ON_DEMAND omitted (default ON) to cut TX VRAM and stop PCIe spill
     VICTORY_PORT_CONSTANTS           = '0'
     VICTORY_PORT_DESCRIPTORS         = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_CBV                 = if ($Safe) { '0' } else { '1' }
@@ -50,18 +48,17 @@ $defaults = @{
     VICTORY_PORT_JOURNAL             = if ($Safe) { '0' } else { '1' }
     VICTORY_RESIDENCY                = '1'
     VICTORY_CARD_GUARD               = '1'
-    VICTORY_TEXTURE_ROOM_PERCENT     = '90'
-    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1100'
+    VICTORY_TEXTURE_ROOM_PERCENT     = "$TextureRoomPct"
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1200'
     VICTORY_CARD_ROOM_FOR_BUFFERS    = '0'
     VICTORY_INDIRECT_REST            = '0'
     VICTORY_XMA_REFILL               = '1'
-    VICTORY_AMBIENT                  = '0.85'
+    VICTORY_AMBIENT                  = if ($FastLight) { 'constant:0.25' } else { '0.85' }
+    VICTORY_AMBIENT_SHADE            = '0,0'
     VICTORY_AMBIENT_MOST             = '1.15'
-    VICTORY_AMBIENT_AIR              = '1.4'
     VICTORY_AMBIENT_SETTLE           = '250,3'
     VICTORY_PIPELINE_WAIT_MS         = "$PipelineWaitMs"
     VICTORY_SCREEN_WAIT_MS           = '10000'
-    VICTORY_D3D12_BACKGROUND         = '0'
     VICTORY_LANE_CORE                = '1'
     VICTORY_TEXTURE_NO_WAIT          = '1'
     VICTORY_RELAY                    = '2'
@@ -86,7 +83,7 @@ $defaults = @{
     VICTORY_WINDOW_TAILS             = '1'
     VICTORY_CARD_BUFFERS_MIN_KB      = '64'
     VICTORY_CARD_BUFFERS_MB          = "$CardBuffersMB"
-    VICTORY_WINDOW_BUDGET_MB         = '512'
+    VICTORY_WINDOW_BUDGET_MB         = '256'
     VICTORY_DSTORAGE_IO              = 'direct'
     VICTORY_DSTORAGE_WORKERS         = '8'
     VICTORY_LOG                      = $LogLevel
@@ -94,68 +91,41 @@ $defaults = @{
     VICTORY_D3D12_DRED               = 'faults'
 }
 
-if ($TargetFps -eq 60) {
-    $defaults['VICTORY_FRAME_INTERVAL_MS'] = '16.667'
-} elseif ($TargetFps -eq 40) {
-    $defaults['VICTORY_FRAME_INTERVAL_MS'] = '25.0'
-} elseif ($TargetFps -eq 0) {
-    $defaults['VICTORY_FRAME_INTERVAL_MS'] = '0'
+if ($RenderScale -ne '' -and $Upscaler -eq 6) {
+    $defaults['VICTORY_RENDER_SCALE'] = $RenderScale
+}
+if (-not $FastLight) {
+    $defaults['VICTORY_AMBIENT_AIR'] = '1.4'
 }
 
-if ($Console -eq 'series-x') {
-    $defaults['VICTORY_OUTPUT'] = $DisplayMode
-}
-if ($Hud) {
-    $defaults['VICTORY_PANEL'] = '1'
-}
-if ($Kbm) {
-    $defaults['VICTORY_KBM_GTA'] = '1'
-}
+if ($TargetFps -eq 60) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '16.667' }
+elseif ($TargetFps -eq 40) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '25.0' }
+elseif ($TargetFps -eq 0) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '0' }
 
-foreach ($k in $defaults.Keys) {
-    Set-Item "Env:$k" $defaults[$k]
-}
+if ($Hud) { $defaults['VICTORY_PANEL'] = '1' }
+if ($Kbm) { $defaults['VICTORY_KBM_GTA'] = '1' }
+
+foreach ($k in $defaults.Keys) { Set-Item "Env:$k" $defaults[$k] }
 
 $logsDir = Join-Path $PSScriptRoot 'logs'
 New-Item -ItemType Directory -Force $logsDir | Out-Null
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runLog = if ($LogFile -ne '') { $LogFile } else { Join-Path $logsDir "run-$timestamp.log" }
 $latestLog = Join-Path $logsDir 'latest.log'
-$runLogDir = Split-Path -Parent $runLog
-if ($runLogDir -and -not (Test-Path $runLogDir)) {
-    New-Item -ItemType Directory -Force $runLogDir | Out-Null
-}
-
-$powerState = 'Unknown'
-try {
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    $powerState = [string][System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus
-    if ($powerState -eq 'Offline') {
-        Write-Warning "LA LAPTOP ESTA EN BATERIA! Conecta el cargador AC: en bateria la RTX 4050 y el CPU bajan su potencia 3x-5x."
-    }
-} catch {}
 
 $header = @(
     "================================================================================"
     "VIctory-Belobug NVIDIA Run Log - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
-    "Console: $Console | DisplayMode: $DisplayMode | TargetFps: $TargetFps | CardBuffersMB: $CardBuffersMB | LogLevel: $LogLevel | Safe: $Safe | Power: $powerState"
+    "Console: $Console | OutputMode: $OutputMode | Upscaler: $Upscaler | RenderScale: $RenderScale | TargetFps: $TargetFps | CardBuffersMB: $CardBuffersMB | TextureRoomPct: $TextureRoomPct | PipelineWaitMs: $PipelineWaitMs | FastLight: $FastLight"
     "Executable: $($exe.FullName)"
     "Runner: $runner"
     "--- VICTORY_* Environment ---"
 )
-foreach ($k in ($defaults.Keys | Sort-Object)) {
-    $header += "$k=$($defaults[$k])"
-}
-$header += @(
-    "---victory config---"
-    $cfgLines
-    "================================================================================"
-    ""
-)
+foreach ($k in ($defaults.Keys | Sort-Object)) { $header += "$k=$($defaults[$k])" }
+$header += @("---victory config---", $cfgLines, "================================================================================", "")
 $header | Set-Content -Path $runLog -Encoding UTF8
 
-Write-Host "Launching $($exe.Name) [VIctory-Belobug NVIDIA | $Console | $DisplayMode | ${TargetFps}FPS | CardBuffers=${CardBuffersMB}MB]" -ForegroundColor Cyan
-Write-Host "Guardando log en: $runLog (y copia al cerrar en $latestLog)" -ForegroundColor Green
+Write-Host "Launching $($exe.Name) [$Console | Out=$OutputMode | Up=$Upscaler | Scale=$RenderScale | CardBuf=${CardBuffersMB}MB | TexRoom=${TextureRoomPct}% | FastLight=$FastLight]" -ForegroundColor Cyan
 
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
@@ -167,9 +137,7 @@ try {
     & $runner run $exe.FullName --console $Console --execute 2>&1 | ForEach-Object {
         $line = "$_"
         $writer.WriteLine($line)
-        if ($LogLevel -ne 'warn' -or $line -match 'WARN|ERROR|fps|panic|removed') {
-            Write-Host $line
-        }
+        if ($LogLevel -ne 'warn' -or $line -match 'WARN|ERROR|fps|panic|removed|resolution:') { Write-Host $line }
     }
     $exitCode = $LASTEXITCODE
 } finally {
