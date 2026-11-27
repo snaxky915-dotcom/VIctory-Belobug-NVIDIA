@@ -25,9 +25,31 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-/// Bytes of a block; pieces of more than half of one are not pooled (with
+/// Bytes of a default block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
+/// Smaller block size for `<= 6 GiB` VRAM adapters so evicted textures return
+/// whole heaps to WDDM 4x faster with ~4x less fragmentation.
+const SMALL_BLOCK: u64 = 16 << 20;
+
+fn default_block_bytes(local_vram_budget: Option<u64>) -> u64 {
+    const SIX_GIB: u64 = 6 << 30;
+    match local_vram_budget {
+        Some(b) if b <= SIX_GIB => SMALL_BLOCK,
+        _ => BLOCK,
+    }
+}
+
+fn texture_block_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_BLOCK_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb.clamp(8, 64) << 20)
+            .unwrap_or_else(|| default_block_bytes(crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b)))
+    })
+}
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -254,6 +276,8 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// Bytes per block in this pool (`BLOCK` by default; `SMALL_BLOCK` on `<= 6 GiB` cards).
+    block_bytes: u64,
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
@@ -261,7 +285,14 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            block_bytes: BLOCK,
+            retry_growth_at: 0,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -282,7 +313,8 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        let block_bytes = self.block_bytes;
+        if len == 0 || len > if ripe.ahead > 0 { block_bytes } else { block_bytes / 2 } {
             return None;
         }
         self.rested(now);
@@ -318,7 +350,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block_bytes)).count();
             if empty < ripe.ahead
                 && GROW_AHEAD.load(Ordering::Relaxed)
                 && let Some(memory) = self.grow(now, &mut make)
@@ -354,7 +386,13 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(self.block_bytes),
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+        });
         i
     }
 
@@ -371,6 +409,7 @@ impl<B: Clone> Pool<B> {
     /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
     /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
+        let block_bytes = self.block_bytes;
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -378,7 +417,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(block_bytes);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -387,7 +426,7 @@ impl<B: Clone> Pool<B> {
             self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(block_bytes)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -421,12 +460,15 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    let pool = lock(&TEXTURES);
+    (pool.blocks() as u64 * pool.block_bytes).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    let tex = lock(&TEXTURES);
+    let stg = lock(&STAGING);
+    [tex.blocks() as u64 * (tex.block_bytes >> 20), stg.blocks() as u64 * (stg.block_bytes >> 20)]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -719,28 +761,35 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    let block_bytes = texture_block_bytes();
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
+    let (piece, heap, again) = {
+        let mut pool = lock(&TEXTURES);
+        if pool.blocks.is_empty() {
+            pool.block_bytes = block_bytes;
         }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+        pool.take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: block_bytes,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, "no block of texture memory");
+            }
+            if let Some(h) = &heap
+                && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+            {
+                tracing::warn!(error = %e, "a block of texture memory is not resident");
+                return None;
+            }
+            heap
+        })
+    }?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -754,7 +803,7 @@ pub(crate) unsafe fn texture(
             {
                 crate::book::made(&made, || "a texture in a block".into());
                 where_the_card_reads(&heap, &made, piece);
-                crate::book::block(&heap, &made, piece.start, BLOCK);
+                crate::book::block(&heap, &made, piece.start, block_bytes);
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
                     let (submission, since) = block.unwrap_or_default();
@@ -848,6 +897,9 @@ mod tests {
         assert_eq!(default_ahead(Some(8 * GIB)), 4);
         assert_eq!(default_ahead(Some(15 * GIB)), 6);
         assert_eq!(default_ahead(Some(22 * GIB)), 12);
+        assert_eq!(default_block_bytes(Some(5 * GIB)), SMALL_BLOCK);
+        assert_eq!(default_block_bytes(Some(6 * GIB)), SMALL_BLOCK);
+        assert_eq!(default_block_bytes(Some(8 * GIB)), BLOCK);
     }
 
     #[test]

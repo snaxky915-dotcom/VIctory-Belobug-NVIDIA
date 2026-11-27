@@ -6,15 +6,15 @@ param(
     [string]$RenderScale = '0.75',
     [ValidateSet(0, 30, 40, 60)][int]$TargetFps = 60,
     [ValidateRange(64, 1536)][int]$CardBuffersMB = 128,
-    [ValidateRange(0, 6144)][int]$TextureBudgetMB = 1800,
+    [ValidateRange(0, 6144)][int]$TextureBudgetMB = 0,
     [ValidateRange(10, 100)][int]$MeshLimitPct = 100,
     [ValidateRange(1, 16)][int]$MaxAniso = 4,
     [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
-    [ValidateRange(50, 90)][int]$TextureRoomPct = 78,
+    [ValidateRange(50, 90)][int]$TextureRoomPct = 82,
     [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'info',
     [string]$LogFile = '',
     [switch]$LevelsOnDemand,
-    [switch]$PortConstants,
+    [switch]$NoPortConstants,
     [switch]$CardAccounting,
     [switch]$Vsync,
     [switch]$FastLight,
@@ -86,7 +86,7 @@ $defaults = @{
     VICTORY_MAX_ANISO                = "$MaxAniso"
     VICTORY_MESH_LIMIT_PERCENT       = "$MeshLimitPct"
     # VICTORY_LEVELS_ON_DEMAND omitted by default (only set if -LevelsOnDemand is passed)
-    VICTORY_PORT_CONSTANTS           = if ($PortConstants -and -not $Safe) { '1' } else { '0' }
+    VICTORY_PORT_CONSTANTS           = if ($NoPortConstants -or $Safe) { '0' } else { '1' }
     VICTORY_PORT_DESCRIPTORS         = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_CBV                 = if ($Safe) { '0' } else { '1' }
     VICTORY_PORT_GUARD               = if ($Safe) { '0' } else { '1' }

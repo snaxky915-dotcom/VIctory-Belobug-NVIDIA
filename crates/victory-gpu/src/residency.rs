@@ -161,13 +161,14 @@ pub(crate) fn limited_host_ram() -> bool {
 fn next_pressure(was: bool, physical: u64, commit: u64, tight: bool) -> bool {
     if tight {
         // On 16 GB RAM hosts (~15.7 GiB usable), Windows normally sits at
-        // 1.4–2.9 GiB of free physical RAM even with 10+ GiB of free commit;
-        // triggering pressure at <= 3 GiB physical kept pressure stuck on for
-        // the entire run and starved scene/cutscene texture streaming.
+        // 0.7–1.4 GiB of free physical RAM while commit headroom is 10+ GiB;
+        // triggering pressure at <= 1.25 GiB physical kept pressure stuck on
+        // and starved scene/cutscene texture streaming. Guard real commit and
+        // very low physical RAM (< 512 MiB) instead.
         if was {
-            physical < 1920 * MIB || commit < 4608 * MIB
+            physical < 1024 * MIB || commit < 4608 * MIB
         } else {
-            physical <= 1280 * MIB || commit <= 3072 * MIB
+            physical <= 512 * MIB || commit <= 3072 * MIB
         }
     } else if was {
         physical < 5 * GIB || commit < 6 * GIB
@@ -269,11 +270,12 @@ mod tests {
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB, false));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB, false));
 
-        // 16 GB host thresholds: ~2.9 GiB free physical + 11.5 GiB commit stays unpressured
+        // 16 GB host thresholds: ~0.9–2.9 GiB free physical + 11.5 GiB commit stays unpressured
         assert!(!next_pressure(false, 2986 * MIB, 11855 * MIB, true));
-        assert!(next_pressure(false, 1280 * MIB, 11855 * MIB, true));
+        assert!(!next_pressure(false, 900 * MIB, 11855 * MIB, true));
+        assert!(next_pressure(false, 512 * MIB, 11855 * MIB, true));
         assert!(next_pressure(false, 2986 * MIB, 3072 * MIB, true));
-        assert!(!next_pressure(true, 1920 * MIB, 4608 * MIB, true));
+        assert!(!next_pressure(true, 1024 * MIB, 4608 * MIB, true));
     }
 
     #[test]
