@@ -3,15 +3,15 @@ param(
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [ValidateSet('1280x720', '1664x936', '1920x1080')][string]$OutputMode = '1280x720',
     [ValidateSet(6, 7)][int]$Upscaler = 6,
-    [string]$RenderScale = '0.75',
+    [string]$RenderScale = '0.67',
     [ValidateSet(0, 30, 40, 60)][int]$TargetFps = 60,
-    [ValidateRange(64, 1536)][int]$CardBuffersMB = 128,
+    [ValidateRange(64, 1536)][int]$CardBuffersMB = 192,
     [ValidateRange(0, 6144)][int]$TextureBudgetMB = 0,
     [ValidateRange(10, 100)][int]$MeshLimitPct = 100,
-    [ValidateRange(1, 16)][int]$MaxAniso = 4,
+    [ValidateRange(1, 16)][int]$MaxAniso = 2,
     [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
     [ValidateRange(50, 92)][int]$TextureRoomPct = 88,
-    [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'info',
+    [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'warn',
     [string]$LogFile = '',
     [switch]$LevelsOnDemand,
     [switch]$NoPortConstants,
@@ -104,7 +104,7 @@ $defaults = @{
     VICTORY_AMBIENT_SETTLE           = '250,3,1.5'
     VICTORY_PIPELINE_WAIT_MS         = "$PipelineWaitMs"
     VICTORY_LIBRARY_STORE_LATER      = '1'
-    VICTORY_LIST_IDLE_TRIM_S         = '30'
+    VICTORY_LIST_IDLE_TRIM_S         = '20'
     VICTORY_D3D12_BACKGROUND         = '0'
     VICTORY_SCREEN_WAIT_MS           = '10000'
     VICTORY_LANE_CORE                = '1'
@@ -129,14 +129,14 @@ $defaults = @{
     VICTORY_LATE_WAIT_LISTS          = '224'
     VICTORY_WINDOW_KB                = '256'
     VICTORY_WINDOW_TAILS             = '1'
-    VICTORY_CARD_BUFFERS_MIN_KB      = '1024'
+    VICTORY_CARD_BUFFERS_MIN_KB      = '2048'
     VICTORY_CARD_BUFFERS_MB          = "$CardBuffersMB"
-    VICTORY_WINDOW_BUDGET_MB         = '256'
+    VICTORY_WINDOW_BUDGET_MB         = '192'
     VICTORY_DSTORAGE_IO              = 'direct'
     VICTORY_DSTORAGE_WORKERS         = '8'
     VICTORY_LOG                      = $LogLevel
     VICTORY_CARD_ACCOUNTING          = if ($CardAccounting) { '1' } else { '0' }
-    VICTORY_D3D12_DRED               = 'faults'
+    VICTORY_D3D12_DRED               = if ($LogLevel -eq 'debug') { 'faults' } else { 'off' }
 }
 
 if ($LevelsOnDemand) {
