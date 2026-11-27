@@ -115,7 +115,6 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
-            "VICTORY_LANE_SPLIT",
             "VICTORY_LDS_FLAGS",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
@@ -140,6 +139,10 @@ fn build() -> [u8; 32] {
         // their key.
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+        }
+        // Only when explicitly set to "exact", so existing cached shaders keep their key.
+        if std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact") {
+            bytes.extend_from_slice(b"VICTORY_LANE_SPLIT=exact");
         }
         bytes
     });

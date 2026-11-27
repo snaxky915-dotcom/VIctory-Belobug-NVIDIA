@@ -9,7 +9,7 @@ param(
     [ValidateRange(0, 6144)][int]$TextureBudgetMB = 0,
     [ValidateRange(10, 100)][int]$MeshLimitPct = 100,
     [ValidateRange(1, 16)][int]$MaxAniso = 4,
-    [ValidateRange(0, 850)][int]$PipelineWaitMs = 0,
+    [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
     [ValidateRange(50, 92)][int]$TextureRoomPct = 88,
     [ValidateSet('warn', 'info', 'debug')][string]$LogLevel = 'info',
     [string]$LogFile = '',
