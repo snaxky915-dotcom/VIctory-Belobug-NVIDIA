@@ -20,6 +20,9 @@ param(
     [switch]$FastLight,
     [switch]$Hud,
     [switch]$FullHud,
+    [ValidateRange(0.1, 10.0)][double]$MouseSens = 1.0,
+    [switch]$InvertY,
+    [switch]$TextureStore,
     [switch]$Kbm,
     [switch]$Safe
 )
@@ -49,6 +52,7 @@ if ($RenderScale -ne '') {
 
 $cfgLines = & $runner config
 $gameDir = ($cfgLines | Where-Object { $_ -match '^game_dir\s*:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
+$cacheDir = ($cfgLines | Where-Object { $_ -match '^cache_dir\s*:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
 $dataDir = ($cfgLines | Where-Object { $_ -match '^data_dir\s*:\s*(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
 if (-not $gameDir) { Write-Error "Could not read game_dir from victory.toml."; exit 2 }
 $exe = Get-ChildItem -Path $gameDir -Filter '*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
@@ -158,7 +162,14 @@ elseif ($TargetFps -eq 0) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '0' }
 
 if ($FullHud) { $defaults['VICTORY_PANEL'] = '1' }
 elseif ($Hud) { $defaults['VICTORY_PANEL'] = 'compact' }
-if ($Kbm) { $defaults['VICTORY_KBM_GTA'] = '1' }
+if ($TextureStore) {
+    $defaults['VICTORY_TEXTURE_STORE'] = if ($cacheDir) { Join-Path $cacheDir 'textures' } else { '1' }
+}
+if ($Kbm) {
+    $defaults['VICTORY_KBM_GTA'] = '1'
+    $defaults['VICTORY_MOUSE_SENS'] = $MouseSens.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    if ($InvertY) { $defaults['VICTORY_MOUSE_INVERT_Y'] = '1' }
+}
 
 foreach ($k in $defaults.Keys) { Set-Item "Env:$k" $defaults[$k] }
 

@@ -31,9 +31,50 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 /// Least bytes of the smaller levels a key is made of.
 pub(crate) const MIN_PREFIX: u64 = 32 << 10;
-/// Bytes of levels kept in memory at most (the rest is read from the folder
-/// when asked).
+/// Default bytes of levels kept in memory on hosts with > 32 GiB RAM.
 const KEPT: u64 = 4 << 30;
+/// Bounded pending write jobs so bursts of streamed textures never spike RAM.
+const MAX_PENDING_JOBS: usize = 64;
+
+fn kept_limit_for(override_mb: Option<u64>, tight: bool, limited: bool) -> u64 {
+    if let Some(mb) = override_mb {
+        return mb << 20;
+    }
+    if tight {
+        256 << 20
+    } else if limited {
+        1 << 30
+    } else {
+        KEPT
+    }
+}
+
+fn kept_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let override_mb = std::env::var("VICTORY_TEXTURE_STORE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        kept_limit_for(override_mb, crate::residency::tight_host_ram(), crate::residency::limited_host_ram())
+    })
+}
+
+fn resolve_folder(raw: &str, cache_dir: Option<&str>, local_app_data: Option<&str>) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("false") || trimmed.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("on") {
+        if let Some(cache) = cache_dir.map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(cache).join("textures"));
+        }
+        if let Some(local) = local_app_data.map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(local).join("VIctory").join("textures"));
+        }
+        return Some(PathBuf::from("textures-cache"));
+    }
+    Some(PathBuf::from(trimmed))
+}
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -58,7 +99,7 @@ struct Store {
     index: Mutex<HashMap<Key, Entry>>,
     kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
     kept_bytes: AtomicU64,
-    jobs: Mutex<mpsc::Sender<Job>>,
+    jobs: Mutex<mpsc::SyncSender<Job>>,
     /// Contents given to it this run (digests of whole textures).
     seen: Mutex<std::collections::HashSet<u128>>,
 }
@@ -89,7 +130,10 @@ fn store() -> Option<&'static Store> {
     static STORE: OnceLock<Option<Store>> = OnceLock::new();
     STORE
         .get_or_init(|| {
-            let folder = PathBuf::from(std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?);
+            let raw = std::env::var("VICTORY_TEXTURE_STORE").ok()?;
+            let cache_dir = std::env::var("VICTORY_CACHE_DIR").ok();
+            let local_app_data = std::env::var("LOCALAPPDATA").ok();
+            let folder = resolve_folder(&raw, cache_dir.as_deref(), local_app_data.as_deref())?;
             std::fs::create_dir_all(&folder).ok()?;
             let mut index = HashMap::new();
             if let Ok(text) = std::fs::read_to_string(folder.join("index.txt")) {
@@ -102,9 +146,10 @@ fn store() -> Option<&'static Store> {
             tracing::info!(
                 folder = %folder.display(),
                 keys = index.len(),
+                ram_limit_mb = kept_limit() >> 20,
                 "texture store: larger levels kept from earlier runs (VICTORY_TEXTURE_STORE)"
             );
-            let (send, receive) = mpsc::channel::<Job>();
+            let (send, receive) = mpsc::sync_channel::<Job>(MAX_PENDING_JOBS);
             let to = folder.clone();
             std::thread::Builder::new()
                 .name("texture store".into())
@@ -180,7 +225,7 @@ pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tile
         return;
     }
     let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
-    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).try_send(job);
 }
 
 /// A texture to keep ([`keep`]).
@@ -225,7 +270,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_limit() {
         store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
         store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
@@ -250,7 +295,7 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_limit() {
                 store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
                 store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
             }
@@ -290,5 +335,31 @@ mod tests {
         assert_eq!(k, key);
         assert_eq!((e.blob, e.levels), (entry.blob, entry.levels));
         assert!(parse_line("1 2 3").is_none());
+    }
+
+    #[test]
+    fn resolve_folder_supports_flag_one_and_explicit_paths() {
+        assert_eq!(resolve_folder("0", Some("C:\\cache"), None), None);
+        assert_eq!(resolve_folder("", Some("C:\\cache"), None), None);
+        assert_eq!(
+            resolve_folder("1", Some("C:\\cache"), Some("C:\\local")),
+            Some(PathBuf::from("C:\\cache").join("textures"))
+        );
+        assert_eq!(
+            resolve_folder("1", None, Some("C:\\local")),
+            Some(PathBuf::from("C:\\local").join("VIctory").join("textures"))
+        );
+        assert_eq!(
+            resolve_folder("D:\\tex", Some("C:\\cache"), None),
+            Some(PathBuf::from("D:\\tex"))
+        );
+    }
+
+    #[test]
+    fn kept_limit_adapts_to_host_ram() {
+        assert_eq!(kept_limit_for(None, true, true), 256 << 20);
+        assert_eq!(kept_limit_for(None, false, true), 1 << 30);
+        assert_eq!(kept_limit_for(None, false, false), 4 << 30);
+        assert_eq!(kept_limit_for(Some(512), true, true), 512 << 20);
     }
 }
