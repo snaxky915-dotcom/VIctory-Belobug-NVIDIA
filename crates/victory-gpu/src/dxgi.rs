@@ -227,22 +227,43 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
+/// Parses a `WxH` display size within valid console/desktop bounds.
+fn parse_display_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value.trim().split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    ((640..=7680).contains(&w) && (360..=4320).contains(&h)).then_some((w, h))
+}
+
+/// Resolves the display size reported to the title:
+/// 1. `VICTORY_DISPLAY_MODE=WxH` if valid,
+/// 2. else `VICTORY_OUTPUT=WxH` if valid (prevents 4K UI planes when running at 720p/1080p),
+/// 3. else 1920x1080 for Series S, or 3840x2160 for Series X.
+fn resolve_display_size(
+    display_mode: Option<&str>,
+    output_mode: Option<&str>,
+    console: crate::console::Console,
+) -> (u32, u32) {
+    if let Some(size) = display_mode.and_then(parse_display_size) {
+        return size;
+    }
+    if let Some(size) = output_mode.and_then(parse_display_size) {
+        return size;
+    }
+    match console {
+        crate::console::Console::SeriesS => (1920, 1080),
+        crate::console::Console::SeriesX => (3840, 2160),
+    }
+}
+
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// if set, else `VICTORY_OUTPUT=WxH` if set, else 1920x1080 on Series S or
+/// 3840x2160 on Series X.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let display_mode = std::env::var("VICTORY_DISPLAY_MODE").ok();
+        let output_mode = std::env::var("VICTORY_OUTPUT").ok();
+        let size = resolve_display_size(display_mode.as_deref(), output_mode.as_deref(), crate::console::current());
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
@@ -304,6 +325,16 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    #[test]
+    fn display_size_follows_override_output_and_console() {
+        use crate::console::Console;
+        assert_eq!(resolve_display_size(None, None, Console::SeriesS), (1920, 1080));
+        assert_eq!(resolve_display_size(None, None, Console::SeriesX), (3840, 2160));
+        assert_eq!(resolve_display_size(None, Some("1280x720"), Console::SeriesS), (1280, 720));
+        assert_eq!(resolve_display_size(Some("1664x936"), Some("1280x720"), Console::SeriesS), (1664, 936));
+        assert_eq!(resolve_display_size(Some("bad"), Some("1280x720"), Console::SeriesX), (1280, 720));
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.

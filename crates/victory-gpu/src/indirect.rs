@@ -136,6 +136,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             g = uint3(0, 0, 0);
         }
         asked = g.x;
+        if (MESH_PCT < 100u && g.x > 1u) {
+            g.x = max(1u, (g.x * MESH_PCT) / 100u);
+        }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
@@ -303,10 +306,27 @@ fn rest() -> u32 {
     u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
 }
 
+/// Percentage of meshlet groups kept per mesh dispatch (`VICTORY_MESH_LIMIT_PERCENT`,
+/// 10..=100; default 100). Dispatches of 1 group stay at 1 so small meshes never vanish.
+pub(crate) fn mesh_limit_percent() -> u32 {
+    static PCT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_MESH_LIMIT_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(100, |v| v.clamp(10, 100))
+    })
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {}\n#define MESH_PCT {}u\n{source}",
+        widest(amd(device)),
+        rest(),
+        mesh_limit_percent()
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.

@@ -1768,6 +1768,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
+        if crate::texture::BAKING.get() {
+            return match memory {
+                Some([budget, used, ..]) => used < budget / 100 * 95,
+                None => true,
+            };
+        }
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
@@ -1778,17 +1784,23 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // One-shot ped/face/clothing decoration bakes (`PS_BakeDecorations_*`)
         // sample their input textures once into permanent targets; never let
         // speculative headroom reservations starve a bake while local VRAM is
-        // still below 96% of budget.
+        // still below budget, but never ignore a real WDDM overrun either.
         Some([budget, used, ..]) if crate::texture::BAKING.get() => {
-            used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 96
+            let room_credit = crate::pool::texture_room().min(budget / 10);
+            used < budget / 100 * 97 && used.saturating_sub(room_credit) < budget / 100 * 96
         }
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
+        // used. Cap the `pool::texture_room()` deduction and enforce a hard
+        // local VRAM ceiling so empty pool blocks never mask a real WDDM
+        // budget overrun (PCIe spill).
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            let room_credit = crate::pool::texture_room().min(budget / 10);
+            let hard_pct = if budget <= (6 << 30) { 92 } else { 96 };
+            used < budget / 100 * hard_pct
+                && used.saturating_sub(room_credit) + crate::shadow::card_room_kept() + targets_room_kept()
+                    < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2141,7 +2153,8 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            let room_credit = crate::pool::texture_room().min(budget / 10);
+            let used = used.saturating_sub(room_credit)
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
             crate::host::vram_keep(budget, used)

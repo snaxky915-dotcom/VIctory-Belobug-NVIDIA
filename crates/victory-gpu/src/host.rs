@@ -175,8 +175,8 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     let share = |percent: u64| budget / 100 * percent;
     // On <= 6 GiB VRAM budgets (e.g. RTX 4050 6 GB laptop with 5.0 GiB WDDM
     // budget), keep total local usage around 74-80% (~3.7-4.0 GiB) so render
-    // targets (1.4 GiB) + 640 MB card buffers + active textures never spill
-    // over the 5.0 GiB budget into slow PCIe shared memory.
+    // targets + 256 MB card buffers + active textures never spill over the
+    // 5.0 GiB budget into slow PCIe shared memory.
     if budget <= (6 << 30) {
         if used < share(76) {
             return (30_000, u64::MAX);
@@ -247,6 +247,23 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
 fn wait_resident() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
+}
+
+/// Whether CPU-RAM `shared_buffer` allocations also pay synchronous
+/// `MakeResident` + copy-queue fence waits (`VICTORY_WAIT_RESIDENT=all`).
+/// Off by default because `shadow::exact` allocates hundreds of small
+/// system-RAM view buffers per frame (which caused 90+ s of fence stalls on
+/// NVIDIA while default-heap VRAM pool blocks stay protected by `wait_resident`).
+fn wait_resident_shared() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WAIT_RESIDENT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("all")))
+}
+
+/// Whether presentation waits for VSync (`VICTORY_VSYNC=1`; off by default so
+/// DXGI uses tearing when supported for lower latency and higher FPS).
+fn vsync_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_VSYNC").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The flag memory is made with that [`resident`] waits for.
@@ -1324,7 +1341,7 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
     if buffers.is_empty() {
         return;
     }
-    let limit = if keep_freed() { SPARE_BATCH_MAX } else { 16 };
+    let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_BATCH_MAX } else { 16 };
     let mut overflow = Vec::new();
     {
         let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -9248,6 +9265,8 @@ struct Presenter {
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
     panel: panel::Panel,
+    /// Swap chain was created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`.
+    allow_tearing: bool,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9945,7 +9964,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = if vsync_enabled() {
+                p.swap_chain.Present(1, DXGI_PRESENT(0))
+            } else if p.allow_tearing {
+                p.swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING)
+            } else {
+                p.swap_chain.Present(0, DXGI_PRESENT(0))
+            };
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
@@ -9974,6 +9999,17 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let allow_tearing = !vsync_enabled()
+                && factory.cast::<IDXGIFactory5>().ok().is_some_and(|f5| {
+                    let mut supported: u32 = 0;
+                    f5.CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                        (&raw mut supported).cast(),
+                        size_of_val(&supported) as u32,
+                    )
+                    .is_ok()
+                        && supported != 0
+                });
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9985,6 +10021,11 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: if allow_tearing {
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             let swap_chain = factory
@@ -9992,7 +10033,14 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                vsync = vsync_enabled(),
+                allow_tearing,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
@@ -10005,6 +10053,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
+                allow_tearing,
             })
         }
     }
@@ -10165,12 +10214,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let wait_shared = wait_resident_shared();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    if wait_shared { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE },
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10178,8 +10228,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait_shared {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };

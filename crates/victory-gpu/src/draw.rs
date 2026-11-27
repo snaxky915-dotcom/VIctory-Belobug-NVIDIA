@@ -3594,8 +3594,14 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
+                    let pct = crate::indirect::mesh_limit_percent();
+                    let groups = if pct < 100 && x > 1 {
+                        (u64::from(x) * u64::from(pct) / 100).max(1) as u32
+                    } else {
+                        x
+                    };
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    unsafe { l6.DispatchMesh(groups.min(65_535), 1, 1) };
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);

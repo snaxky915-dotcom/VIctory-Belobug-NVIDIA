@@ -1,7 +1,30 @@
-# VIctory on an RX 7900 XTX
+# VIctory-Belobug-NVIDIA
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+An NVIDIA-tuned fork of [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+(itself based on [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) and
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory)), a compatibility layer that runs an
+Xbox Series title natively on Windows from files the user supplies.
+
+## Focus of this fork
+
+- **NVIDIA Wave32 GPUs and low-VRAM laptops** (tested on RTX 4050 Laptop 6 GB / 5.0 GiB WDDM budget, Intel i7-12650H, 16 GB RAM).
+- **Zero forced 4K leakage**: DXGI display mode follows `VICTORY_DISPLAY_MODE` -> `VICTORY_OUTPUT` -> Series S (1080p) / Series X (4K).
+- **Strict WDDM VRAM budgeting**: texture pools (`pool.rs`), texture queue/eviction (`resource.rs`), card buffer caps (`shadow.rs`), and batch buffer reuse (`host.rs`) scale down for `<= 6 GiB` budgets instead of reserving 24 GB-class heaps.
+- **Lower CPU & GPU overhead**: amortized `shadow::exact` map sweeps, no synchronous `MakeResident`/copy-queue fence waits on system-RAM `shared_buffer` allocations, optional mesh group cap (`VICTORY_MESH_LIMIT_PERCENT`), sampler anisotropy cap (`VICTORY_MAX_ANISO`), DXGI tearing (`VICTORY_VSYNC=0`), P-core affinity (`VICTORY_LANE_CORE=1`), and tuned [`Play-Laptop.ps1`](Play-Laptop.ps1) with automatic full logging to `logs/latest.log`.
+
+**Quick start (NVIDIA 6 GB / 16 GB laptop):**
+
+```powershell
+git clone https://github.com/snaxky915-dotcom/VIctory-Belobug-NVIDIA
+cd VIctory-Belobug-NVIDIA
+copy victory.example.toml victory.toml      # set paths outside this folder
+cargo build --release --locked -p victory
+.\Play-Laptop.ps1 -Hud                      # 720p Series S, logs in logs\latest.log
+```
+
+---
+
+## Upstream notes (VIctory on an RX 7900 XTX)
 
 ## The goal
 

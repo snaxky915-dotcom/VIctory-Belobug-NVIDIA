@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -37,11 +37,22 @@ const SPARE_KEPT: usize = 64;
 const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+/// Whether speculative ahead-of-time empty texture blocks may be grown
+/// (`false` once local VRAM is already tight).
+static GROW_AHEAD: AtomicBool = AtomicBool::new(true);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// scaled down on `<= 6 GiB` / `<= 10 GiB` budgets so small cards do not
+/// hoard gigabytes of empty 64 MiB heaps. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    let grow_ok = match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            let cap = if budget <= (6 << 30) { 80 } else { 90 };
+            u128::from(used) * 100 < u128::from(budget) * cap
+        }
+        _ => true,
+    };
+    GROW_AHEAD.store(grow_ok, Ordering::Relaxed);
     if !crate::residency::on() {
         SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
         return;
@@ -69,7 +80,30 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    const ONE_GIB: u64 = 1 << 30;
+    const SIX_GIB: u64 = 6 << 30;
+    const TEN_GIB: u64 = 10 << 30;
     match memory {
+        // Low-VRAM adapters (e.g. 6 GB laptop with ~5.0 GiB WDDM budget):
+        // never hoard up to 4 GiB (`SPARE_KEPT`) of empty 64 MiB heaps.
+        // Guard `budget >= ONE_GIB` so synthetic small-number tests exercise
+        // the standard percentage boundary unchanged.
+        Some([budget, used, ..]) if budget >= ONE_GIB && budget <= SIX_GIB => {
+            if keep && u128::from(used) * 100 < u128::from(budget) * 72 {
+                4
+            } else if u128::from(used) * 100 < u128::from(budget) * 84 {
+                SPARE
+            } else {
+                1
+            }
+        }
+        Some([budget, used, ..]) if budget > SIX_GIB && budget <= TEN_GIB => {
+            if keep && u128::from(used) * 100 < u128::from(budget) * 80 {
+                12
+            } else {
+                SPARE
+            }
+        }
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
     }
@@ -101,9 +135,26 @@ pub(crate) fn on() -> bool {
 /// `indirect::tests::new_blocks_under_readers` never loses it). A block that
 /// every submission begun before its making has left behind ([`Ripe`]) has
 /// no such lists: pieces are cut from those first.
+fn default_ahead(local_vram_budget: Option<u64>) -> usize {
+    const SIX_GIB: u64 = 6 << 30;
+    const TEN_GIB: u64 = 10 << 30;
+    const SIXTEEN_GIB: u64 = 16 << 30;
+    match local_vram_budget {
+        Some(b) if b <= SIX_GIB => 2,
+        Some(b) if b <= TEN_GIB => 4,
+        Some(b) if b <= SIXTEEN_GIB => 6,
+        _ => 12,
+    }
+}
+
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| default_ahead(crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b)))
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -269,6 +320,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
+                && GROW_AHEAD.load(Ordering::Relaxed)
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -783,10 +835,19 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
+        const GIB: u64 = 1 << 30;
         assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+        // Low-VRAM <= 6 GiB tier (e.g. RTX 4050 6 GB with 5 GiB WDDM budget).
+        assert_eq!(spares(Some([5 * GIB, 3 * GIB, 0, 0]), true), 4);
+        assert_eq!(spares(Some([5 * GIB, 4 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([5 * GIB, 4500 << 20, 0, 0]), true), 1);
+        assert_eq!(default_ahead(Some(5 * GIB)), 2);
+        assert_eq!(default_ahead(Some(8 * GIB)), 4);
+        assert_eq!(default_ahead(Some(15 * GIB)), 6);
+        assert_eq!(default_ahead(Some(22 * GIB)), 12);
     }
 
     #[test]

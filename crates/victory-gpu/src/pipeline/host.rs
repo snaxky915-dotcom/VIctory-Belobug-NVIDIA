@@ -576,6 +576,7 @@ impl HostPipeline {
                     });
                 }
             }
+            let aniso_cap = crate::sampler::max_anisotropy_cap();
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
@@ -583,7 +584,7 @@ impl HostPipeline {
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
                     MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
+                    MaxAnisotropy: s.max_anisotropy.min(aniso_cap).max(1),
                     ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
                     BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
                     MinLOD: s.min_lod,

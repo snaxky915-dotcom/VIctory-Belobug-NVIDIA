@@ -169,6 +169,8 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
+/// - `<= 6 GiB` (6 GB cards, whose WDDM budget is ~5.0 GiB): `(4, 256)` MiB so
+///   shader-written world buffers fit in VRAM without triggering PCIe spill.
 /// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
 ///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
@@ -181,9 +183,12 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const SIX_GIB_MB: u64 = 6 * 1024;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb <= SIX_GIB_MB {
+        (4, 256)
+    } else if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
@@ -412,31 +417,35 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
-    let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
-    {
-        // Said, with the numbers it was decided by: run 193 made 31 copies
-        // of 95 and no line named the others. The first 64, then every
-        // 32nd.
-        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
-        let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
-        if n <= 64 || n.is_multiple_of(32) {
-            tracing::info!(
-                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
-                 {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
-                size >> 10,
-                used >> 20,
-                budget >> 20,
-                (budget / 100 * hundredths) >> 20,
-                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
-                most >> 20,
-                n,
-                bytes >> 20,
-                crate::frame::current()
-            );
+    if let Some([budget, used, ..]) = host.video_memory() {
+        let hundredths = if card_room_kept_on() {
+            if budget <= (6 << 30) { 92 } else { 97 }
+        } else {
+            80
+        };
+        if used + size > budget / 100 * hundredths {
+            // Said, with the numbers it was decided by: run 193 made 31 copies
+            // of 95 and no line named the others. The first 64, then every
+            // 32nd.
+            let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+            if n <= 64 || n.is_multiple_of(32) {
+                tracing::info!(
+                    "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
+                     {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+                    size >> 10,
+                    used >> 20,
+                    budget >> 20,
+                    (budget / 100 * hundredths) >> 20,
+                    CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                    most >> 20,
+                    n,
+                    bytes >> 20,
+                    crate::frame::current()
+                );
+            }
+            return None;
         }
-        return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
@@ -5638,9 +5647,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// bytes), each with the asking that last took it; the askings so far, and
+/// the next map-size watermark at which idle entries are swept.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, usize, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, 256, BTreeMap::new()));
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -5673,7 +5683,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
+    let (tick, next_sweep, map) = &mut *guard;
     *tick += 1;
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
@@ -5681,12 +5691,14 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    if map.len() >= *next_sweep {
         // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
+        // slot shows it), and not asked for lately. Advance the watermark so
+        // thousands of live entries are not re-scanned on every cache miss.
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        *next_sweep = map.len().saturating_add(MANY);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
@@ -5710,7 +5722,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).2.len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
@@ -5751,7 +5763,11 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // 6 GB tier (<= 6 GiB WDDM budget): 4 MiB min, 256 MiB cap.
+        assert_eq!(default_card_limits_mb(Some(5 * GIB)), (4, 256));
+        assert_eq!(default_card_limits_mb(Some(6 * GIB)), (4, 256));
+
+        // Unknown (WARP / query failure) and > 6 GiB..=12 GiB keep the 12 GB baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
         assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));

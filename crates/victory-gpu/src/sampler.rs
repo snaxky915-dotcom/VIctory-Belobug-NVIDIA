@@ -3,7 +3,25 @@
 //! fields. (Immediate samplers in shader code come decoded with the
 //! translation.)
 
+use std::sync::OnceLock;
+
 use windows::Win32::Graphics::Direct3D12::*;
+
+/// Maximum anisotropy permitted on host samplers (`VICTORY_MAX_ANISO`, 1..=16;
+/// default 16). Lowering to 4 reduces texture-unit bandwidth on small GPUs.
+pub(crate) fn max_anisotropy_cap() -> u32 {
+    static CAP: OnceLock<u32> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_MAX_ANISO")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(16, |v| v.clamp(1, 16))
+    })
+}
+
+fn clamp_anisotropy(anisotropy: u32, cap: u32) -> u32 {
+    anisotropy.clamp(1, cap.clamp(1, 16))
+}
 
 /// The fields both forms share.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,7 +84,7 @@ impl Fields {
                     .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
             },
             MaxAnisotropy: if aniso {
-                self.anisotropy.clamp(1, 16)
+                clamp_anisotropy(self.anisotropy, max_anisotropy_cap())
             } else {
                 1
             },
@@ -124,6 +142,15 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anisotropy_cap_clamps_correctly() {
+        assert_eq!(clamp_anisotropy(16, 4), 4);
+        assert_eq!(clamp_anisotropy(8, 4), 4);
+        assert_eq!(clamp_anisotropy(2, 4), 2);
+        assert_eq!(clamp_anisotropy(0, 4), 1);
+        assert_eq!(clamp_anisotropy(16, 16), 16);
+    }
 
     #[test]
     fn console_descriptions_decode() {
