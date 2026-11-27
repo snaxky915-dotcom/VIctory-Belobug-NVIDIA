@@ -112,6 +112,15 @@ impl Made {
         self.locks[lock].lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn try_lock(&self, index: u32) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let lock = index.wrapping_mul(0x9E37_79B1) as usize >> (32 - 14);
+        match self.locks[lock].try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     fn get(&self, index: u32) -> Option<u64> {
         Some(self.keys.get(index as usize)?.load(std::sync::atomic::Ordering::Acquire))
     }
@@ -957,18 +966,23 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
+    // Pages are mapped one after the other or in overlapping blocks.
     if let Some(last) = ranges.last_mut()
-        && last.1 == start
+        && start <= last.1
+        && end >= last.0
     {
-        last.1 = end;
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        join(&mut ranges);
+        if ranges.len() >= MOST {
+            // Still full after coalescing: drop the oldest half instead of all.
+            let drop_count = ranges.len() / 2;
+            STALE[2].fetch_add(drop_count as u64, Relaxed);
+            ranges.drain(..drop_count);
+        }
     }
     ranges.push((start, end));
 }
@@ -1171,7 +1185,7 @@ impl TextureQueue {
     fn all_due(&self, frame: u64) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+            due[usize::from((w.looks == 0 && w.mapped == 0) || w.checked.2 != 0)].push((w.written, index, w.write));
         }
         due
     }
@@ -1285,7 +1299,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: u8::from(waited), mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -2445,7 +2459,9 @@ impl HostHeap {
         }
         let mut released = 0;
         for slot in slots {
-            let _made = self.made.lock(slot);
+            let Some(_made) = self.made.try_lock(slot) else {
+                continue;
+            };
             let Some(key) = self.made.get(slot).filter(|&k| k != 0) else {
                 continue;
             };

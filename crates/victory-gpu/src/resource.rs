@@ -1339,13 +1339,16 @@ fn mapped_first_mip(r: &Resource, first: u32) -> u32 {
     if start == 0 {
         return first;
     }
+    let mips = &layout.mips;
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    if let Some(0) = crate::inplace::shown_bytes(start as usize, layout.size as usize) {
+        return (tail as u32).min(mips.len() as u32 - 1).max(first);
+    }
     let limit = crate::descriptor::host::next_start(start, start.saturating_add(layout.size))
         .map_or(layout.size, |at| at.saturating_sub(start));
     if limit >= layout.size && crate::texture::committed(r.data().cast_const(), layout.size as usize) {
         return first;
     }
-    let mips = &layout.mips;
-    let tail = (layout.first_tail_mip as usize).min(mips.len());
     for (level, m) in mips.iter().enumerate().take(tail).skip(first as usize) {
         let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
         if end > m.offset
@@ -2264,8 +2267,12 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
+    // Collect placed textures whose bindless heap slots need releasing, and
+    // release them AFTER dropping `all` (`TEXTURES.lock()`), because
+    // `HostHeap::mirror` locks `HostHeap::made` before `TEXTURES.lock()`.
+    let mut to_release_slots: Vec<(u64, bool, u64)> = Vec::new();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes.saturating_add(demoted_bytes) >= most {
+        if bytes >= most {
             break;
         }
         looked += 1;
@@ -2280,7 +2287,6 @@ pub(crate) fn let_go_idle() {
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
-        let mut need_slot_release = None;
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let mut idle = false;
@@ -2300,7 +2306,7 @@ pub(crate) fn let_go_idle() {
                     // stale bindless slot references in `HostHeap::kept` so the
                     // next sweep can reclaim the `HostTexture`.
                     if unmapped || (most != u64::MAX && crate::host::long_ago(used, idle_ms.max(8_000), IDLE_FRAMES * 4)) {
-                        need_slot_release = Some((start, unmapped, host.bytes));
+                        to_release_slots.push((start, unmapped, host.bytes));
                     }
                 }
             }
@@ -2314,11 +2320,6 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((start, unmapped, host_bytes)) = need_slot_release
-            && crate::descriptor::host::release_placed_slots(start, unmapped) > 0
-        {
-            demoted_bytes = demoted_bytes.saturating_add(host_bytes);
-        }
         if let Some((host, _)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
@@ -2329,6 +2330,15 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+        }
+    }
+    drop(all);
+    for (start, unmapped, host_bytes) in to_release_slots {
+        if !unmapped && bytes.saturating_add(demoted_bytes) >= most {
+            continue;
+        }
+        if crate::descriptor::host::release_placed_slots(start, unmapped) > 0 {
+            demoted_bytes = demoted_bytes.saturating_add(host_bytes);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);

@@ -1685,11 +1685,17 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    if by_query() {
-        return committed_by_query(at, len);
-    }
     if len == 0 {
         return true;
+    }
+    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
+        && let Some(there) = crate::inplace::shown_bytes(at as usize, len)
+    {
+        return there >= len as u64;
+    }
+    if by_query() {
+        return committed_by_query(at, len);
     }
     let (there, of) = readable(at as usize, len, true);
     there == of

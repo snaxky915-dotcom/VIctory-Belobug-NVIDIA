@@ -276,6 +276,11 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// Placeholder reservations (`MEM_RESERVE_PLACEHOLDER`) where physical
+    /// page views live: by base address -> byte length. Used by [`shown_bytes`]
+    /// to return `Some(0)` in ~20 ns when no physical page view is mapped yet
+    /// inside a placeholder, avoiding fallback kernel syscalls.
+    placeholders: BTreeMap<usize, usize>,
     /// By section and byte offset of a 64 KiB page: the address of that
     /// page in every view that shows it. A write through one view of a
     /// page is a write of the bytes every other view shows
@@ -294,6 +299,7 @@ struct Views {
 /// runtime maps or unmaps.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
+    placeholders: BTreeMap::new(),
     pages: BTreeMap::new(),
     pages_twice: 0,
     sections: Vec::new(),
@@ -457,10 +463,47 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     runs
 }
 
+/// The runtime reserved `[at, at + len)` as a 64 KiB-page placeholder region
+/// (`XMemVirtualAlloc` with `MEM_RESERVE_PLACEHOLDER`).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if at == 0 || len == 0 {
+        return;
+    }
+    let mut v = views_mut();
+    v.placeholders.insert(at, len);
+}
+
+/// Forgets any placeholder record touching `[at, at + len)` when freed.
+pub(crate) fn placeholder_gone(at: usize, len: usize) {
+    let mut v = views_mut();
+    if v.placeholders.is_empty() {
+        return;
+    }
+    if len == 0 {
+        v.placeholders.remove(&at);
+        return;
+    }
+    let end = at.saturating_add(len);
+    let first = v.placeholders.range(..=at).next_back().filter(|(base, bytes)| *base + **bytes > at).map(|(base, _)| *base);
+    let overlapping: Vec<usize> = first.into_iter().chain(v.placeholders.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
+    for base in overlapping {
+        let Some(bytes) = v.placeholders.remove(&base) else {
+            continue;
+        };
+        let old_end = base.saturating_add(bytes);
+        if base < at {
+            v.placeholders.insert(base, at - base);
+        }
+        if old_end > end {
+            v.placeholders.insert(end, old_end - end);
+        }
+    }
+}
+
 /// How many bytes of `[at, at + len)` views of physical pages show; `None`
-/// if no view touches it (nothing is mapped there, or memory of another
-/// kind). The runtime's own record of what it mapped: no question to the
-/// host.
+/// if no view touches it (and it does not lie in a known placeholder
+/// reservation). The runtime's own record of what it mapped: no question to
+/// the host.
 pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
     let end = at.saturating_add(len);
     let v = views();
@@ -474,7 +517,13 @@ pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
             any = true;
         }
     }
-    any.then_some(there)
+    if any {
+        return Some(there);
+    }
+    if v.placeholders.range(..=at).next_back().is_some_and(|(&base, &bytes)| end <= base.saturating_add(bytes)) {
+        return Some(0);
+    }
+    None
 }
 
 /// What of `[at, at + len)` views of physical pages show, in order, pieces

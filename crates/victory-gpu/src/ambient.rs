@@ -225,6 +225,7 @@ static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+    d = (isnan(d) || isinf(d)) ? 0.0 : d;
     float z = min(near / max(d, 1e-7), 1000.0);
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
@@ -240,10 +241,13 @@ void keep(uint3 at : SV_DispatchThreadID) {
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
-        float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
-        // Lamps and glints count, but not for everything.
-        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+        float3 raw = radiance[p];
+        bool bad = any(isnan(raw)) || any(isinf(raw));
+        float3 c = bad ? 0.0 : clamp(raw, 0.0, 64.0);
+        if (bad || any(raw < 0.0) || any(raw > 64.0)) radiance[p] = c;
+        // Lamps and sunlit windows count, but soft-knee compressed so distant sky
+        // through a window does not blow out foreground characters indoors.
+        sum += c / max(1.0, dot(c, LUMA) / 6.0);
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
@@ -271,7 +275,10 @@ void mean() {
 void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
-    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+    // Cap emitter area depth at 20 m so sky pixels at z = 1000 m seen through an
+    // indoor window act as a window-sized aperture instead of a 1,000,000 m^2 emitter.
+    float ez = min(p.z, 20.0);
+    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, ez * ez);
 }
 #endif
 
@@ -323,10 +330,23 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
-    float3 c = scattered[at];
+    float cap = max(air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far), 0.0);
+    cap = (isnan(cap) || isinf(cap)) ? 1.0 : min(cap, 32.0);
+    float3 raw = scattered[at];
+    // Prevent (+Inf) * (cap / +Inf) = (+Inf) * 0.0 = NaN in R11G11B10_FLOAT
+    // volumetric fog froxels, which previously caused pitch-black rectangular
+    // froxel cores surrounded by blinding white bloom halos in high-contrast rooms.
+    bool bad = any(isnan(raw)) || any(isinf(raw)) || any(raw < 0.0);
+    float3 c = float3(
+        isnan(raw.r) ? 0.0 : (isinf(raw.r) ? cap : max(raw.r, 0.0)),
+        isnan(raw.g) ? 0.0 : (isinf(raw.g) ? cap : max(raw.g, 0.0)),
+        isnan(raw.b) ? 0.0 : (isinf(raw.b) ? cap : max(raw.b, 0.0))
+    );
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    if (bad || has > cap) {
+        if (has > cap) c *= cap / max(has, 1e-5);
+        scattered[at] = c;
+    }
 }
 #endif
 
@@ -401,11 +421,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
         sb += w * points[at0 + 2];
         sum += w;
     }
-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float3 all = float3(sr.w, sg.w, sb.w) / max(sum, 1e-6);
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / max(sum, 1e-6);
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2);
+    // Soft shadow-toe lift for dark indoor corridors so indirect bounce retains depth
+    // without crushing dark walls or washing out bright rooms.
+    found = max(found, sqrt(max(found, 0.0)) * 0.075);
+    found *= level * open;
     float3 was = unpack(light[p]);
+    if (any(isnan(was)) || any(isinf(was)) || any(was > 32.0)) was = 0.0;
     // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     float left = dot(was, LUMA);
@@ -422,7 +447,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // uninitialized 16x16 screen-probe tiles never form blocky patches on skin/hair.
     float3 written = lerp(found, max(was, found), 0.35);
     // Gentle indoor perceptual floor so unlit rooms without RT never crush to pitch black.
-    written = max(written, float3(0.0055, 0.0054, 0.0052) * level * open);
+    written = max(written, float3(0.012, 0.0116, 0.011) * level * open);
     light[p] = pack_dithered(written, float2(p));
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;

@@ -3054,16 +3054,27 @@ pub(crate) fn let_go_idle() {
             })
             .collect();
         eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
-        let victims = if keep == u64::MAX {
-            (0..eligible.len()).collect()
-        } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+        let mut gone: Vec<Arc<Shadow>> = eligible
+            .into_iter()
+            .filter_map(|(_, key, _, _)| map.remove(&key))
+            .collect();
+        // When RAM is in Watch or High band (`keep < u64::MAX`), also trim any
+        // remaining unreferenced windows whose total bytes still exceed `keep`.
+        if keep < u64::MAX && !map.is_empty() {
+            let mut active: Vec<(u64, (u64, u64), usize, u64)> = map
                 .iter()
-                .map(|&(used, _, id, len)| (used, len, id))
+                .filter(|(_, s)| Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1)
+                .map(|(&key, s)| (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len))
                 .collect();
-            window_victims(&entries, keep)
-        };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+            active.sort_unstable_by_key(|&(used, _, _, _)| used);
+            let entries: Vec<(u64, u64, usize)> = active.iter().map(|&(used, _, id, len)| (used, len, id)).collect();
+            for i in window_victims(&entries, keep) {
+                if let Some(s) = map.remove(&active[i].1) {
+                    gone.push(s);
+                }
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
