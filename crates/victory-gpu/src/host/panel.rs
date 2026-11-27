@@ -27,6 +27,9 @@ const GLYPH: (u32, u32) = (5, 7);
 /// Logical canvas dimensions (1x at <=1600p, 2x at 4K).
 const BASE_W: u32 = 540;
 const BASE_H: u32 = 354;
+/// Compact HUD dimensions (`VICTORY_PANEL=compact` or `small`): ~80% less screen area.
+const COMPACT_W: u32 = 304;
+const COMPACT_H: u32 = 126;
 
 /// How many recent frames the live frame-time graph keeps.
 const HISTORY: usize = 172;
@@ -53,9 +56,17 @@ const YELLOW: [u8; 3] = [245, 208, 66];
 const ORANGE: [u8; 3] = [246, 134, 54];
 const RED: [u8; 3] = [242, 76, 66];
 
+fn compact() -> bool {
+    static COMPACT: OnceLock<bool> = OnceLock::new();
+    *COMPACT.get_or_init(|| {
+        std::env::var("VICTORY_PANEL")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "compact" | "small"))
+    })
+}
+
 fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PANEL"))
+    *ON.get_or_init(|| compact() || crate::switch::on("VICTORY_PANEL"))
 }
 
 /// Whether it is shown now.
@@ -130,8 +141,12 @@ const fn glyph(c: u8) -> [u8; 7] {
 }
 
 /// The box's size in pixels.
-const fn size(scale: u32) -> (u32, u32) {
-    (BASE_W * scale, BASE_H * scale)
+fn size(scale: u32) -> (u32, u32) {
+    if compact() {
+        (COMPACT_W * scale, COMPACT_H * scale)
+    } else {
+        (BASE_W * scale, BASE_H * scale)
+    }
 }
 
 /// Integer scale for the swap-chain height: 1x up to 1440p, 2x at 4K.
@@ -658,6 +673,75 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     c
 }
 
+/// Paints a compact ~304x126 HUD (`VICTORY_PANEL=compact`) that stays out of
+/// the way on 720p/1080p screens while keeping FPS, frame times, VRAM and RAM visible.
+fn paint_hud_compact(s: &Snapshot) -> Canvas {
+    let mut c = Canvas::new(COMPACT_W, COMPACT_H, BG);
+    c.border(0, 0, COMPACT_W, COMPACT_H, BORDER);
+
+    // 1. FPS + frame ms + resolution.
+    let fps_str = format!("{:.1} FPS", s.fps);
+    c.text(8, 8, 2, fps_color(s.fps), &fps_str);
+    let right = format!("{:.0}MS {}X{}", s.frame_ms, s.width, s.height);
+    let rx = COMPACT_W.saturating_sub(8 + right.len() as u32 * 6);
+    c.text(rx, 12, 1, MUTED, &right);
+
+    // 2. Submit / GPU / Draws.
+    let row2 = format!("SUB {:.0}MS | GPU {:.0}MS | DRW {}", s.submit_ms, s.gpu_ms, s.draws);
+    c.text_sep(8, 27, 1, WHITE, &trunc(&row2, 48));
+
+    // 3. Compact sparkline graph.
+    let (gx, gy, gw, gh) = (8u32, 39u32, COMPACT_W - 16, 24u32);
+    c.rect(gx, gy, gw, gh, GRAPH_BG);
+    c.border(gx, gy, gw, gh, BORDER);
+    let peak = s.history_ms.iter().copied().fold(100.0f32, f32::max).min(250.0);
+    let max_scale = if peak > 140.0 { 220.0 } else if peak > 90.0 { 133.0 } else { 100.0 };
+    let bar_w = 2u32;
+    let slots = (gw - 4) / bar_w;
+    let n = s.history_ms.len().min(slots as usize);
+    let start_x = gx + gw - 2 - (n as u32) * bar_w;
+    for (i, &ms) in s.history_ms[s.history_ms.len() - n..].iter().enumerate() {
+        let frac = (ms / max_scale).clamp(0.05, 1.0);
+        let h = ((frac * (gh - 4) as f32) as u32).max(2);
+        let bx = start_x + i as u32 * bar_w;
+        let by = gy + gh - 2 - h;
+        c.rect(bx, by, bar_w.saturating_sub(1).max(1), h, frametime_color(ms));
+    }
+
+    // 4. VRAM local/budget + shared.
+    let near_budget = s.vram_local.is_some_and(|(used, budget)| {
+        budget != 0 && used as f64 / budget as f64 >= 0.92
+    });
+    let vram_line = format!(
+        "VRAM {}/{}G | SH {}G | GPU {}%",
+        display_gib(s.vram_local.map(|v| v.0)),
+        display_gib(s.vram_local.map(|v| v.1)),
+        display_gib(s.vram_shared),
+        s.gpu_pct
+    );
+    c.text_sep(8, 69, 1, if near_budget { ORANGE } else { WHITE }, &trunc(&vram_line, 48));
+
+    // 5. VRAM breakdown.
+    let vram_detail = format!(
+        "RT {:.1} TX {:.1} BF {:.1} BV {:.1} O {}",
+        s.vram_rt_gb, s.vram_tex_gb, s.vram_buf_gb, s.vram_bvh_gb, display_gib(s.vram_other)
+    );
+    c.text(8, 83, 1, MUTED, &trunc(&vram_detail, 48));
+
+    // 6. CPU + RAM + Commit.
+    let ram_line = format!(
+        "CPU {:.0}% | RAM {:.1}/{:.1}G | CMT {:.1}G",
+        s.cpu_pct, s.sys_ram_used_gb, s.sys_ram_total_gb, s.proc_ram_gb
+    );
+    c.text_sep(8, 97, 1, WHITE, &trunc(&ram_line, 48));
+
+    // 7. Dropped draws + 1% low.
+    let bot = format!("1% {:.0} FPS | MAX {:.0}MS | DROP {}", s.low1_fps, s.max_ms, s.dropped);
+    c.text_sep(8, 111, 1, MUTED, &trunc(&bot, 48));
+
+    c
+}
+
 /// The buffers of a box that size and format.
 struct Buffers {
     format: DXGI_FORMAT,
@@ -707,7 +791,8 @@ impl Buffers {
     }
 
     fn write(&mut self, snap: &Snapshot) {
-        let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
+        let canvas = if compact() { paint_hud_compact(snap) } else { paint_hud(snap) };
+        let picture = canvas.pack(self.scale, self.format, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };

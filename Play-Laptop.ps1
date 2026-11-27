@@ -3,10 +3,10 @@ param(
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [ValidateSet('1280x720', '1664x936', '1920x1080')][string]$OutputMode = '1280x720',
     [ValidateSet(6, 7)][int]$Upscaler = 6,
-    [string]$RenderScale = '0.55',
+    [string]$RenderScale = '0.75',
     [ValidateSet(0, 30, 40, 60)][int]$TargetFps = 60,
     [ValidateRange(64, 1536)][int]$CardBuffersMB = 128,
-    [ValidateRange(0, 6144)][int]$TextureBudgetMB = 2048,
+    [ValidateRange(0, 6144)][int]$TextureBudgetMB = 1800,
     [ValidateRange(10, 100)][int]$MeshLimitPct = 100,
     [ValidateRange(1, 16)][int]$MaxAniso = 4,
     [ValidateRange(0, 850)][int]$PipelineWaitMs = 200,
@@ -19,6 +19,7 @@ param(
     [switch]$Vsync,
     [switch]$FastLight,
     [switch]$Hud,
+    [switch]$FullHud,
     [switch]$Kbm,
     [switch]$Safe
 )
@@ -122,10 +123,10 @@ $defaults = @{
     VICTORY_JOIN_PARTS               = '6'
     VICTORY_UPLOAD_AHEAD             = if ($Safe) { '0' } else { '1' }
     VICTORY_SUBMIT_DEPTH             = '16'
-    VICTORY_LATE_WAIT_LISTS          = '160'
+    VICTORY_LATE_WAIT_LISTS          = '224'
     VICTORY_WINDOW_KB                = '256'
     VICTORY_WINDOW_TAILS             = '1'
-    VICTORY_CARD_BUFFERS_MIN_KB      = '64'
+    VICTORY_CARD_BUFFERS_MIN_KB      = '1024'
     VICTORY_CARD_BUFFERS_MB          = "$CardBuffersMB"
     VICTORY_WINDOW_BUDGET_MB         = '256'
     VICTORY_DSTORAGE_IO              = 'direct'
@@ -152,7 +153,8 @@ if ($TargetFps -eq 60) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '16.667' }
 elseif ($TargetFps -eq 40) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '25.0' }
 elseif ($TargetFps -eq 0) { $defaults['VICTORY_FRAME_INTERVAL_MS'] = '0' }
 
-if ($Hud) { $defaults['VICTORY_PANEL'] = '1' }
+if ($FullHud) { $defaults['VICTORY_PANEL'] = '1' }
+elseif ($Hud) { $defaults['VICTORY_PANEL'] = 'compact' }
 if ($Kbm) { $defaults['VICTORY_KBM_GTA'] = '1' }
 
 foreach ($k in $defaults.Keys) { Set-Item "Env:$k" $defaults[$k] }
