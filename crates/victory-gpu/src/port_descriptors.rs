@@ -433,10 +433,11 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         *by.entry(writer.clone()).or_default() += 1;
     }
     if should_warn_missed(n) {
-        tracing::warn!(
+        tracing::debug!(
             slot = index,
             handle = format_args!("{handle:#x}"),
             %writer,
+            tabled,
             "renderer port 2: a view record in the title's heap that no store told of (found by the fallback; made now)"
         );
     }

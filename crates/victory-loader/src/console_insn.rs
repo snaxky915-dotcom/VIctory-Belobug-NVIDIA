@@ -385,7 +385,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     {
         seen.push(std::mem::discriminant(&what));
         if what != ConsoleOnly::Ud2 {
-            tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
+            tracing::info!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
         }
     }
     #[cfg(feature = "diagnostics")]

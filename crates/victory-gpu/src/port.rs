@@ -103,9 +103,9 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
-/// memory.
+/// memory (non-null).
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    on() && at != 0 && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the

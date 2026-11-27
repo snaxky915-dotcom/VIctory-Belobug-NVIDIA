@@ -2763,17 +2763,34 @@ impl State {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
-                    tracing::warn!(
-                        first_level = first,
-                        blocks_shown_elsewhere = elsewhere.len(),
-                        slot = index,
-                        address = format_args!("{at:#x}"),
-                        bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
-                        changed = n + 1,
-                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                    );
+                    if elsewhere.is_empty() {
+                        tracing::warn!(
+                            first_level = first,
+                            blocks_shown_elsewhere = 0usize,
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                        );
+                    } else {
+                        // Expected for CPU-painted textures whose pages are mapped at
+                        // another virtual view; `recheck_soon()` re-uploads them on the
+                        // next frame automatically.
+                        tracing::debug!(
+                            first_level = first,
+                            blocks_shown_elsewhere = elsewhere.len(),
+                            slot = index,
+                            address = format_args!("{at:#x}"),
+                            bytes = len,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            looks,
+                            changed = n + 1,
+                            "an aliased texture picked by index changed through another view: uploaded again"
+                        );
+                    }
                 }
             }
             let mut partly = None;

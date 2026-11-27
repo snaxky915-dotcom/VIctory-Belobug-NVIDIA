@@ -3215,6 +3215,22 @@ fn unguard(g: &Guards, blocks: &[usize]) {
     }
 }
 
+/// Notifies the placed-texture tracker of `[at, at + len)` and any alias
+/// views showing the same physical pages (`elsewhere`), so placed textures
+/// backed by those pages refresh on the next frame instead of waiting for
+/// the fallback recheck.
+fn remapped_with_aliases(at: usize, len: usize) {
+    crate::descriptor::host::remapped(at, len);
+    if len == 0 {
+        return;
+    }
+    for (_, others) in elsewhere(at, len) {
+        for other in others {
+            crate::descriptor::host::remapped(other, BLOCK);
+        }
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
@@ -3232,8 +3248,9 @@ pub fn writing(at: usize, len: usize) {
         }
         let _ = opened;
     }
-    // A placed texture there changes with no descriptor written.
-    crate::descriptor::host::remapped(at, len);
+    // A placed texture there (or at another view of the same pages) changes
+    // with no descriptor written.
+    remapped_with_aliases(at, len);
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
@@ -3263,7 +3280,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
             g.kernel.push((first, last));
         }
     }
-    crate::descriptor::host::remapped(at, len);
+    remapped_with_aliases(at, len);
     KernelWrite(first, if len == 0 { first } else { last })
 }
 
