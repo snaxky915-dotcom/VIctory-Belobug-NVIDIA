@@ -278,6 +278,10 @@ struct Pool<B> {
     most: usize,
     /// Bytes per block in this pool (`BLOCK` by default; `SMALL_BLOCK` on `<= 6 GiB` cards).
     block_bytes: u64,
+    /// Milliseconds a returned piece rests before reuse (`REST` by default;
+    /// `750` on `<= 6 GiB` texture pools where `retire` already waits for GPU
+    /// completion).
+    rest_ms: u64,
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
@@ -291,6 +295,7 @@ impl<B: Clone> Pool<B> {
             spare: 0,
             most,
             block_bytes: BLOCK,
+            rest_ms: REST,
             retry_growth_at: 0,
         }
     }
@@ -397,7 +402,7 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest_ms, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -767,6 +772,9 @@ pub(crate) unsafe fn texture(
         let mut pool = lock(&TEXTURES);
         if pool.blocks.is_empty() {
             pool.block_bytes = block_bytes;
+            if block_bytes <= SMALL_BLOCK {
+                pool.rest_ms = 750;
+            }
         }
         pool.take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
             let desc = D3D12_HEAP_DESC {

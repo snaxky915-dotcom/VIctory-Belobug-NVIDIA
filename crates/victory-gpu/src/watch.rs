@@ -3365,6 +3365,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         return;
     }
     let ranges = crate::inplace::views_of_section(section, offset, len);
+    for &(at, n) in &ranges {
+        crate::descriptor::host::remapped(at, n);
+    }
     // (A block is noted in `PROTECTED` ahead of the look at its page's views
     // that did not find this one yet.)
     if !ranges.iter().any(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
@@ -3391,6 +3394,9 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
+    }
+    for &other in &others {
+        crate::descriptor::host::remapped(other, BLOCK);
     }
     let mut g = guards();
     // (The view itself too: the part that stays is read-only until then. And

@@ -271,14 +271,20 @@ impl Worker {
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
+            let mut recorded = false;
             for job in jobs {
-                job.record(&self.list);
+                if job.staging.dirty.load(Relaxed) {
+                    job.record(&self.list);
+                    recorded = true;
+                }
             }
             self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
-            self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            if recorded {
+                self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+                self.queue.Signal(&self.fence, value)?;
+                // (Without an event: this waits.)
+                self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            }
         }
         Ok(())
     }
@@ -313,10 +319,14 @@ impl Job {
 /// The jobs' copies have run.
 fn finish(jobs: Vec<Arc<Job>>) {
     for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
-        job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        if job.staging.dirty.swap(false, Relaxed) {
+            job.staging.uploaded.store(true, Relaxed);
+            job.staging.note_held();
+            job.copy.ahead.store(DONE, Relaxed);
+        } else {
+            job.copy.ahead.store(NONE, Relaxed);
+            crate::descriptor::host::read_short(job.staging.memory as u64);
+        }
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     for job in &jobs {

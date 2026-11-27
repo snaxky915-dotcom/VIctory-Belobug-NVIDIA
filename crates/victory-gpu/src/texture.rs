@@ -763,7 +763,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let baking = BAKING.get();
     if baking {
         staging.exact.store(true, Relaxed);
-        staging.dirty.store(true, Relaxed);
     }
     let picking = PICKING.get();
     if picking.is_none() {
@@ -828,9 +827,11 @@ fn claim_upload(
     dirty: &std::sync::atomic::AtomicBool,
 ) -> Option<bool> {
     use std::sync::atomic::Ordering::AcqRel;
+    if !dirty.swap(false, AcqRel) {
+        return None;
+    }
     let was_uploaded = uploaded.swap(true, AcqRel);
-    let was_dirty = dirty.swap(false, AcqRel);
-    (!was_uploaded || was_dirty).then_some(!was_uploaded)
+    Some(!was_uploaded)
 }
 
 /// A title texture deferred to submission time so `staging.refresh()` runs
@@ -1942,7 +1943,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         shape: desc.shape(),
         memory,
         last: Mutex::default(),
-        dirty: std::sync::atomic::AtomicBool::new(true),
+        dirty: std::sync::atomic::AtomicBool::new(false),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         expected: std::sync::atomic::AtomicU64::new(0),

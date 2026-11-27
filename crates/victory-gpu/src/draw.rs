@@ -3954,16 +3954,23 @@ impl State {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
+                        // On hosts without raw twins (NVIDIA 1M view heap cap),
+                        // only 256-byte aligned CBVs can be bound in place;
+                        // check alignment before locking `shadow::find` 17,000x/frame.
                         if crate::port_cbv::in_place_on() {
-                            match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                                Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
-                                        crate::port_cbv::in_place(size);
-                                        continue;
+                            if !host.has_raw_twins() && !address.is_multiple_of(256) {
+                                crate::port_cbv::copied(false);
+                            } else {
+                                match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
+                                    Some(shadow) => {
+                                        if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                            crate::port_cbv::in_place(size);
+                                            continue;
+                                        }
+                                        crate::port_cbv::copied(false);
                                     }
-                                    crate::port_cbv::copied(false);
+                                    None => crate::port_cbv::copied(true),
                                 }
-                                None => crate::port_cbv::copied(true),
                             }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
@@ -4994,15 +5001,19 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 }
 
 /// The longest wait, in milliseconds, between two looks at a texture slot
-/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: about
-/// four seconds counted in passes, as before). The looks back off 1, 2, 4,
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; unset: 1,000 ms
+/// counted by actual frame time so multiple passes per frame do not inflate
+/// `most` to 256 frames / 40+ seconds). The looks back off 1, 2, 4,
 /// ... frames up to it. Measured (run light-22, `crate::texlate`): from
 /// the last look that found a slot's memory away to its upload, half under
 /// 0.5 s but nine in ten under 32 s: the memory had come long before.
 fn look_ms() -> Option<u64> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        let ms = std::env::var("VICTORY_TEXTURE_LOOK_MS").ok()?.trim().parse::<u64>().ok().filter(|&ms| ms > 0)?;
+        let ms = match std::env::var("VICTORY_TEXTURE_LOOK_MS") {
+            Ok(v) => v.trim().parse::<u64>().ok().filter(|&ms| ms > 0)?,
+            Err(_) => 1000,
+        };
         tracing::info!(ms, "texture slots waiting for their memory are looked at at least this often (VICTORY_TEXTURE_LOOK_MS)");
         Some(ms)
     })

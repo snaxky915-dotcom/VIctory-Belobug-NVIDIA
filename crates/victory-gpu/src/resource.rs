@@ -1289,13 +1289,13 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    // Only cap large block-compressed world textures (4x4 texel blocks with full
-    // mip chains >= 6 levels) and never drop below 1024 unless explicitly asked:
-    // shrinking alpha-tested hair strand masks or non-BC LUTs to 256/512 causes
-    // transparent hair gaps and broken lookups.
+    // Only cap large block-compressed world textures (4x4 texel blocks with
+    // mip chains >= 4 levels, or > 1024 per side) and never drop below 1024
+    // unless explicitly asked: shrinking alpha-tested hair strand masks or
+    // non-BC LUTs to 256/512 causes transparent hair gaps and broken lookups.
     if set.is_none() {
         let is_bc = element(desc.format).is_some_and(|(_, block_w)| block_w == 4);
-        if !is_bc || desc.mip_levels < 6 {
+        if !is_bc || desc.mip_levels < 4 {
             return 0;
         }
     }
@@ -1308,6 +1308,57 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
         skip += 1;
     }
     skip
+}
+
+/// For a placed 2D texture `r` viewed from level `first`: the first (largest)
+/// level `>= first` whose bytes lie before the next packed texture
+/// (`crate::descriptor::host::next_start`) and are committed in title memory.
+/// Prevents allocating multi-megabyte unmapped top mip levels in VRAM and
+/// prevents detiling unmapped zeros into `MostDetailedMip` while a texture is
+/// still streaming in its tail mips.
+#[cfg(windows)]
+fn mapped_first_mip(r: &Resource, first: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+        || !fills(&r.desc)
+        || r.desc.dimension != TEXTURE_2D
+        || r.desc.depth_or_array_size != 1
+        || r.desc.mip_levels <= 1
+        || r.desc.sample_count > 1
+    {
+        return first;
+    }
+    let Some(t) = texture_layout(&r.desc).filter(|t| t.planes.len() == 1) else {
+        return first;
+    };
+    let layout = &t.planes[0].layout;
+    if layout.slices != 1 || layout.mips.len() <= 1 || layout.desc.swizzle.xor() {
+        return first;
+    }
+    let start = r.data() as u64;
+    if start == 0 {
+        return first;
+    }
+    let limit = crate::descriptor::host::next_start(start, start.saturating_add(layout.size))
+        .map_or(layout.size, |at| at.saturating_sub(start));
+    if limit >= layout.size && crate::texture::committed(r.data().cast_const(), layout.size as usize) {
+        return first;
+    }
+    let mips = &layout.mips;
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    for (level, m) in mips.iter().enumerate().take(tail).skip(first as usize) {
+        let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
+        if end > m.offset
+            && end <= limit
+            && crate::texture::committed(
+                r.data().cast_const().wrapping_add(m.offset as usize),
+                (end - m.offset) as usize,
+            )
+        {
+            return level as u32;
+        }
+    }
+    (tail as u32).min(mips.len() as u32 - 1).max(first)
 }
 
 /// The level a host copy begins at for views that start at `first`: one the
@@ -1427,7 +1478,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    let mapped_first = mapped_first_mip(r, first);
+    if host.base == 0 || host.base <= base_level(&r.desc, mapped_first) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1656,12 +1708,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            let requested = if first == u32::MAX { 0 } else { first };
+            let mapped_first = mapped_first_mip(r, requested);
+            base = base_level(&r.desc, mapped_first);
             // The store has its larger levels: made whole at once.
             if over_cap(&r.desc) == 0
                 && base > 0
                 && tiled.is_none()
-                && let Some(found) = stored_levels(r, first)
+                && let Some(found) = stored_levels(r, requested)
             {
                 base = 0;
                 prefill = Some(found);
@@ -1791,20 +1845,22 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // speculative headroom reservations starve a bake while local VRAM is
         // still below budget, but never ignore a real WDDM overrun either.
         Some([budget, used, ..]) if crate::texture::BAKING.get() => {
-            let room_credit = crate::pool::texture_room().min(budget / 10);
-            used < budget / 100 * 97 && used.saturating_sub(room_credit) < budget / 100 * 96
+            let room_credit = crate::pool::texture_room().min(budget / 4);
+            let effective_used = used.saturating_sub(room_credit);
+            effective_used < budget / 100 * 96 && used < budget / 100 * 98
         }
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used. Cap the `pool::texture_room()` deduction and enforce a hard
-        // local VRAM ceiling so empty pool blocks never mask a real WDDM
-        // budget overrun (PCIe spill).
+        // used. Credit free space inside already-allocated `pool::TEXTURES`
+        // blocks (`texture_room()`) because sub-allocating from existing pool
+        // heaps adds zero new WDDM allocations.
         Some([budget, used, ..]) => {
-            let room_credit = crate::pool::texture_room().min(budget / 10);
+            let room_credit = crate::pool::texture_room().min(budget / 5);
+            let effective_used = used.saturating_sub(room_credit);
             let hard_pct = if budget <= (6 << 30) { 95 } else { 96 };
-            used < budget / 100 * hard_pct
-                && used.saturating_sub(room_credit) + crate::shadow::card_room_kept() + targets_room_kept()
+            effective_used < budget / 100 * hard_pct
+                && effective_used + crate::shadow::card_room_kept() + targets_room_kept()
                     < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2176,7 +2232,7 @@ pub(crate) fn let_go_idle() {
     }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let (mut went, mut bytes, mut demoted_bytes, mut first) = (0u64, 0u64, 0u64, None);
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
@@ -2209,7 +2265,7 @@ pub(crate) fn let_go_idle() {
     let mut looked = 0;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if bytes.saturating_add(demoted_bytes) >= most {
             break;
         }
         looked += 1;
@@ -2224,13 +2280,30 @@ pub(crate) fn let_go_idle() {
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
+        let mut need_slot_release = None;
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
+            let mut idle = false;
+            if let Some((host, _)) = made.as_ref()
+                && crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                && std::sync::Arc::strong_count(host) == 1
+            {
+                let refs = crate::host::references(&host.texture);
+                if refs == 1 {
+                    idle = true;
+                } else if r.host.placed.load(Relaxed) {
+                    let start = r.data() as u64;
+                    let unmapped = start != 0 && !crate::texture::committed(r.data().cast_const(), 1);
+                    // If the placed texture's title memory is unmapped, or if
+                    // we are actively reclaiming VRAM (`most != u64::MAX`) and
+                    // this texture has been untouched for >= 8 s, release its
+                    // stale bindless slot references in `HostHeap::kept` so the
+                    // next sweep can reclaim the `HostTexture`.
+                    if unmapped || (most != u64::MAX && crate::host::long_ago(used, idle_ms.max(8_000), IDLE_FRAMES * 4)) {
+                        need_slot_release = Some((start, unmapped, host.bytes));
+                    }
+                }
+            }
             if idle {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
@@ -2241,6 +2314,11 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
+        if let Some((start, unmapped, host_bytes)) = need_slot_release
+            && crate::descriptor::host::release_placed_slots(start, unmapped) > 0
+        {
+            demoted_bytes = demoted_bytes.saturating_add(host_bytes);
+        }
         if let Some((host, _)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);

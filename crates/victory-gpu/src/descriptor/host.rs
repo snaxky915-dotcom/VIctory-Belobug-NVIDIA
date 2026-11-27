@@ -561,6 +561,16 @@ fn remove_pending_list_flip(id: u64) {
     let _ = take_pending_list_flip(id);
 }
 
+/// Releases the host texture reference held in [`HostHeap::kept`] by any
+/// slot viewing the placed texture at `start` so `crate::resource::let_go_idle`
+/// can reclaim its VRAM.
+pub(crate) fn release_placed_slots(start: u64, unmapped: bool) -> usize {
+    if start == 0 {
+        return 0;
+    }
+    super::with_view_heap(|host| host.evict_placed_slots_at(start, unmapped)).unwrap_or(0)
+}
+
 /// Makes the slots whose new texture's upload has run
 /// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
 /// something else: the next texture pass does.
@@ -2386,9 +2396,12 @@ impl HostHeap {
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
         const AWAY_MS: u64 = 3000;
         static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let wait = *WAIT.get_or_init(|| {
+        let base_wait = *WAIT.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
         });
+        // Under VRAM pressure (`!room_lately()`), reclaim unmapped slots
+        // within 250 ms instead of holding evicted textures in VRAM for 3 s.
+        let wait = if crate::resource::room_lately() { base_wait } else { base_wait.min(250) };
         let _made = self.made.lock(index);
         let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
             return false;
@@ -2411,6 +2424,57 @@ impl HostHeap {
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Releases the host texture reference held in [`HostHeap::kept`] by any
+    /// slot currently viewing the placed texture at `start` so
+    /// `crate::resource::let_go_idle` can reclaim its VRAM. When `unmapped` is
+    /// true, the slot becomes null (`unmake`); when `unmapped` is false (idle
+    /// eviction under VRAM pressure), the slot is demoted to the 1x1 neutral
+    /// texture while remaining registered in [`Spans`] for future remaps/bakes.
+    fn evict_placed_slots_at(&self, start: u64, unmapped: bool) -> usize {
+        if self.sampler || start == 0 {
+            return 0;
+        }
+        let slots = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.slots_at(start)
+        };
+        if slots.is_empty() {
+            return 0;
+        }
+        let mut released = 0;
+        for slot in slots {
+            let _made = self.made.lock(slot);
+            let Some(key) = self.made.get(slot).filter(|&k| k != 0) else {
+                continue;
+            };
+            if self.kept_in(slot).is_none() {
+                continue;
+            }
+            if unmapped {
+                self.unmake(slot);
+                STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                released += 1;
+            } else {
+                let view = view_at(key as u32, (key >> 32) as u32);
+                self.quick_is(slot, 0);
+                self.made.set(slot, 0);
+                let kept = match &view {
+                    Some(v) => neutral_for(v, self.at(slot)),
+                    None => {
+                        null_view(self.at(slot));
+                        None
+                    }
+                };
+                self.put(slot);
+                self.clear_twin(slot);
+                self.write_stride(slot, 0);
+                self.keep(slot, kept);
+                released += 1;
+            }
+        }
+        released
     }
 
     /// Whether host slot `index` shows the placed texture the title's record
@@ -3344,41 +3408,42 @@ impl HostHeap {
         self.keep(index, holds.then(|| buffer.clone()));
     }
 
+    /// Whether this heap has raw twins (`self.raw != 0`). On hosts capped at
+    /// [`PORTABLE_VIEWS`] (NVIDIA), raw twins are absent and translated shaders
+    /// read table constant buffers as standard D3D12 CBVs at slot `index`.
+    pub(crate) fn has_raw_twins(&self) -> bool {
+        self.raw != 0
+    }
+
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
     /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
     /// (title memory in place) with nothing copied: its raw twin a raw view
-    /// of those bytes, which translated shaders read; the slot itself a
-    /// constant buffer view of them where that can be (on 256 bytes), else a
-    /// null one. Whether the twin was made (`false`: the caller copies the
-    /// bytes as before).
+    /// of those bytes, which translated shaders read (or, on hosts without
+    /// raw twins such as NVIDIA where shaders read standard D3D12 CBVs, a
+    /// direct in-place CBV whenever `gpu` is 256-byte aligned).
     pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
         let Some(host) = host() else { return false };
-        let Some(twin) = self.twin(index) else { return false };
+        let twin = self.twin(index);
+        if twin.is_none() && (self.raw != 0 || !gpu.is_multiple_of(256)) {
+            return false;
+        }
         // SAFETY: a live buffer.
         let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
             return false;
         };
-        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
-        if bytes == 0 {
+        let room = width - offset;
+        let bytes = u64::from(constant_bytes(size)).min(room) & !3;
+        if bytes == 0 || (twin.is_none() && room < 256) {
             return false;
         }
-        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: (bytes / 4) as u32,
-                    StructureByteStride: 0,
-                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                },
-            },
-        };
         let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
-            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+            BufferLocation: if gpu.is_multiple_of(256) && room >= 256 { gpu } else { 0 },
+            SizeInBytes: if gpu.is_multiple_of(256) && room >= 256 {
+                constant_bytes(size).min((room & !255) as u32)
+            } else {
+                0
+            },
         };
         let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
@@ -3386,9 +3451,24 @@ impl HostHeap {
         unsafe {
             host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
             self.put(index);
-            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            if let Some(twin) = twin {
+                let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: offset / 4,
+                            NumElements: (bytes / 4) as u32,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            }
         }
-        self.twin_made(index, true);
+        self.twin_made(index, twin.is_some());
         self.write_stride(index, 0);
         self.keep(index, Some(buffer.clone()));
         true
@@ -4570,7 +4650,7 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if crate::port_cbv::on() {
+            if crate::port_cbv::on() && twin.is_some() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
                 // raw, with no end on AMD.
