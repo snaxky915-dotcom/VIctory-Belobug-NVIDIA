@@ -261,6 +261,18 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // F11 toggles borderless fullscreen over the window's monitor (key
+    // repeats ignored; the title never sees the key). Ported from
+    // ZigZagBoi1/ScarlettPort (GPL-3.0).
+    if (message == wm::WM_KEYDOWN || message == wm::WM_SYSKEYDOWN) && wparam == VK_F11 {
+        if lparam & (1 << 30) == 0 {
+            toggle_fullscreen(hwnd);
+        }
+        return 0;
+    }
+    if (message == wm::WM_KEYUP || message == wm::WM_SYSKEYUP) && wparam == VK_F11 {
+        return 0;
+    }
     // Auto-hide the Windows cursor inside the game window's client area while
     // GTA mouse-look lock (`~` / `F2`) is active, and restore it immediately
     // when unlocked (`~` / `F2` / `Esc` / `P`).
@@ -299,6 +311,77 @@ extern "system" fn window_proc(
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+    }
+}
+
+/// The F11 key's virtual-key code.
+const VK_F11: usize = 0x7A;
+
+/// Borderless fullscreen over the monitor the window is on, or back to the
+/// style and placement it had before. What the title draws is stretched to
+/// the window by the swap chain, as with any window size.
+fn toggle_fullscreen(hwnd: HWND) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    static SAVED: Mutex<Option<(u32, wm::WINDOWPLACEMENT)>> = Mutex::new(None);
+    let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `hwnd` is the title's window, on the thread that owns it; the
+    // structures are sized as the calls require.
+    unsafe {
+        if let Some((style, placement)) = saved.take() {
+            wm::SetWindowLongW(hwnd, wm::GWL_STYLE, style as i32);
+            wm::SetWindowPlacement(hwnd, &placement);
+            wm::SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                wm::SWP_NOMOVE
+                    | wm::SWP_NOSIZE
+                    | wm::SWP_NOZORDER
+                    | wm::SWP_NOOWNERZORDER
+                    | wm::SWP_FRAMECHANGED,
+            );
+            tracing::info!("F11: windowed");
+            return;
+        }
+        let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
+        let mut placement: wm::WINDOWPLACEMENT = std::mem::zeroed();
+        placement.length = size_of::<wm::WINDOWPLACEMENT>() as u32;
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if wm::GetWindowPlacement(hwnd, &mut placement) == 0
+            || GetMonitorInfoW(monitor, &mut info) == 0
+        {
+            return;
+        }
+        let frame = wm::WS_CAPTION
+            | wm::WS_THICKFRAME
+            | wm::WS_SYSMENU
+            | wm::WS_MINIMIZEBOX
+            | wm::WS_MAXIMIZEBOX;
+        let full = (style & !frame) | wm::WS_POPUP | wm::WS_VISIBLE;
+        wm::SetWindowLongW(hwnd, wm::GWL_STYLE, full as i32);
+        let r = info.rcMonitor;
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            wm::SWP_NOOWNERZORDER | wm::SWP_FRAMECHANGED,
+        );
+        *saved = Some((style, placement));
+        tracing::info!(
+            width = r.right - r.left,
+            height = r.bottom - r.top,
+            "F11: fullscreen"
+        );
     }
 }
 

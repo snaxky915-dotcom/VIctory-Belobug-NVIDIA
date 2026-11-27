@@ -456,6 +456,10 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The host heaps (view, sampler) the list has while `host_heaps_set`:
+    /// another title heap that comes to the same host heaps leaves the list
+    /// as it is ([`same_host_heaps`], ported from ZigZagBoi1/ScarlettPort).
+    host_heap_objs: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1614,22 +1618,32 @@ impl State {
             if fallback && sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
-            if let Some(h) = view_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if let Some(h) = sampler_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if !heaps.is_empty() {
-                // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+            let objs = [
+                view_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+                sampler_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+            ];
+            // Title heaps that resolve to the host heaps the list already has
+            // (e.g. fallbacks): setting them again triggers expensive pipeline
+            // flushes on NVIDIA and clears the root signature + bindings.
+            if !(self.host_heaps_set && same_host_heaps() && objs == self.host_heap_objs) {
+                let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+                if let Some(h) = view_heap {
+                    list.keep(&h);
+                    heaps.push(Some(h));
+                }
+                if let Some(h) = sampler_heap {
+                    list.keep(&h);
+                    heaps.push(Some(h));
+                }
+                if !heaps.is_empty() {
+                    // SAFETY: an open list and shader-visible heaps.
+                    unsafe { l.SetDescriptorHeaps(&heaps) };
+                }
+                self.host_heap_objs = objs;
+                self.host_roots = [0; 2];
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
-            self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -5045,6 +5059,14 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
     }
+}
+
+/// Whether a change of title heaps that leaves the host heaps unchanged skips
+/// `SetDescriptorHeaps` and root-signature resets (on by default;
+/// `VICTORY_SAME_HOST_HEAPS=0` restores setting them on every change).
+fn same_host_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SAME_HOST_HEAPS").map_or(true, |v| v.trim() != "0"))
 }
 
 #[cfg(test)]
